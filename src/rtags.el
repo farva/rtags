@@ -36,7 +36,7 @@
 (if (or (> emacs-major-version 24)
         (and (= emacs-major-version 24)
              (>= emacs-minor-version 3)))
-    (progn 
+    (progn
       (require 'cl-lib)
       (defalias 'defun* 'cl-defun)) ;; cl-lib has own namespace now
   (eval-when-compile
@@ -851,6 +851,10 @@ return t if rtags is allowed to modify this file"
   (setq rtags-location-stack nil)
   (setq rtags-location-stack-index 0))
 
+(defun rtags-not-indexed/connected-message-p (string)
+  (or (string= string "Not indexed\n")
+      (string= string "Can't seem to connect to server\n")))
+
 (defun rtags-target (&optional filter)
   (let ((path (buffer-file-name))
         (location (rtags-current-location)))
@@ -860,8 +864,7 @@ return t if rtags is allowed to modify this file"
           (setq rtags-last-request-not-indexed nil)
           (cond ((= (point-min) (point-max))
                  (message "RTags: No target") nil)
-                ((or (string= (buffer-string) "Not indexed\n")
-                     (string= (buffer-string) "Can't seem to connect to server\n"))
+                ((rtags-not-indexed/connected-message-p (buffer-string))
                  (setq rtags-last-request-not-indexed t) nil)
                 (t (buffer-substring-no-properties (point-min) (- (point-max) 1))))))))
 
@@ -989,7 +992,7 @@ References to references will be treated as references to the referenced symbol"
                     (when (run-hook-with-args-until-failure 'rtags-edit-hook)
                       (incf modifications)
                       (rtags-goto-line-col (cadr value) (cddr value))
-                      (when (cond ((looking-at "~") (forward-char))
+                      (when (cond ((looking-at "~") (forward-char) t)
                                   ((looking-at "auto ") nil)
                                   (t))
 
@@ -1481,8 +1484,12 @@ References to references will be treated as references to the referenced symbol"
          (message "RTags: No results") nil)
         ((= (count-lines (point-min) (point-max)) 1)
          (let ((string (buffer-string)))
-           (bury-buffer)
-           (rtags-goto-location string)))
+           (if (rtags-not-indexed/connected-message-p string)
+               (progn
+                 (setq rtags-last-request-not-indexed t)
+                 nil)
+             (bury-buffer)
+             (rtags-goto-location string))))
         (t
          (switch-to-buffer-other-window rtags-buffer-name)
          (shrink-window-if-larger-than-buffer)
