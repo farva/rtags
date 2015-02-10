@@ -35,6 +35,7 @@ public:
         CursorInfo,
         DeleteProject,
         Dependencies,
+        DumpCompilationDatabase,
         DumpCompletions,
         DumpFile,
         FindFile,
@@ -62,10 +63,12 @@ public:
         Status,
         Suspend,
         SyncProject,
-        UnloadProject
+        UnloadProject,
+        GenerateTest
     };
 
     enum Flag {
+        NoFlag = 0x00000000,
         NoContext = 0x00000001,
         FilterSystemIncludes = 0x00000004,
         StripParentheses = 0x00000008,
@@ -94,7 +97,8 @@ public:
         SynchronousCompletions = 0x04000000,
         NoSortReferencesByInput = 0x08000000,
         HasLocation = 0x10000000,
-        WildcardSymbolNames = 0x20000000
+        WildcardSymbolNames = 0x20000000,
+        NoColor = 0x40000000
     };
 
     QueryMessage(Type type = Invalid);
@@ -150,6 +154,16 @@ public:
         }
     }
 
+    void setFlag(Flag flag, bool on = true)
+    {
+        if (on) {
+            mFlags |= flag;
+        } else {
+            mFlags &= ~flag;
+        }
+    }
+
+    static Flag flagFromString(const String &string);
     static unsigned keyFlags(unsigned queryFlags);
     inline unsigned keyFlags() const { return keyFlags(mFlags); }
 

@@ -24,11 +24,21 @@
       ":"
       (group (zero-or-more digit))))
 
+(defcustom rtags-ac-expand-functions t
+  "Whether to expand function parameter lists in auto-complete mode"
+  :group 'rtags
+  :type 'boolean)
+
 (defmacro rtags-parse-location (locstr)
   `(when (string-match rtags-location-regx ,locstr)
      (list (match-string 1 ,locstr)
            (match-string 2 ,locstr)
            (match-string 3 ,locstr))))
+
+(defun rtags-ac-trim-leading-trailing-whitespace (argstr)
+  (replace-regexp-in-string
+   (rx (one-or-more blank) string-end) ""
+   (replace-regexp-in-string (rx string-start (one-or-more blank)) "" argstr)))
 
 (defun rtags-ac-candidates ()
   ;; locstr is fullpath_srcfile:row#:col#
@@ -50,15 +60,18 @@
     ;; #("word" 'rtags-ac-full "void word(int x)" 'rtags-ac-type "FunctionDecl")
     (if (and (string= (buffer-name (current-buffer)) file)
              complpt
+             (cdr-safe rtags-last-completion-position)
              (= complpt (cdr rtags-last-completion-position)))
         (mapcar #'(lambda (elem)
                     (propertize (car elem)
                                 'rtags-ac-full (cadr elem)
                                 'rtags-ac-type (caddr elem)))
                 (cadr rtags-last-completions))
-      ;; else forcefully update completions
+      ;; else forcefully update completions if the compl pos has changed
+      ;; checking compl pos helps keep the process buffer from getting slammed
+      (rtags-update-completions (not (= (or complpt -1)
+                                        (or (cdr-safe rtags-last-completion-position) -1))))
       ;; return nil as `ac-update-greedy' expects us to return a list or nil
-      (rtags-update-completions t)
       nil)))
 
 (defun rtags-ac-document (item)
@@ -72,38 +85,41 @@
     (cond ((or (string= type "CXXMethod")
                (string= type "FunctionDecl")
                (string= type "FunctionTemplate"))
-           (rtags-ac-action-function tag))
+           (and rtags-ac-expand-functions (rtags-ac-action-function tag)))
+          ((or (string= type "Namespace")
+               (string= type "NamespaceAlias"))
+           (rtags-ac-action-namespace tag))
           (t
            nil))))
 
-(defun rtags-ac-action-function (tag)
-  ;; transform func sig to a list of arg signatures
-  (let ((arglist (split-string
-                  tag
-                  (rx (or "..." ","))
-                  t
-                  (rx (or (group (zero-or-more any) "(")
-                          (group ")" (zero-or-more any))))))
-        insertfunc inserttxt)
+(defun rtags-ac-action-function (origtag)
+  ;; grab only inside the func arg list: int func( int x, int y )
+  ;;                                              ^............^
+  (let* ((tag (replace-regexp-in-string
+               (rx (zero-or-more any) "(") ""
+               (replace-regexp-in-string (rx ")" (zero-or-more any)) "" origtag)))
+         (arglist (mapcar #'rtags-ac-trim-leading-trailing-whitespace
+                          (split-string tag
+                                        (rx (or ","))
+                                        t)))
+         insertfunc inserttxt)
 
     ;; for yasnippet, wrap each elem in arg list with ${}
     ;; 'int arg' => ${int arg}
     (cond ((featurep 'yasnippet)
-           (setq inserttxt (mapconcat
-                            'identity
-                            (mapcar
-                             #'(lambda (arg)
-                                 (when (string-match ".*" arg)
-                                   (replace-match
-                                    (concat "${" arg "}")
-                                    t t arg)))
-                             arglist)
-                            ", "))
+           (setq inserttxt (mapconcat #'(lambda (arg)
+                                          (format "%s%s%s" "${" arg "}"))
+                                      arglist
+                                      ", "))
            (setq insertfunc #'yas-expand-snippet))
+          ;; if no yasnippet, just dump the signature
           (t
            (setq insertfunc #'(lambda (txt) (save-excursion (insert txt)) (forward-char)))
-           (setq inserttxt (mapconcat 'identity arglist ""))))
+           (setq inserttxt (mapconcat 'identity arglist ", "))))
     (apply insertfunc (list (concat "(" inserttxt ")")))))
+
+(defun rtags-ac-action-namespace (origtag)
+  (insert "::"))
 
 (defun rtags-ac-prefix ()
   ;; shamelessly borrowed from clang-complete-async
@@ -118,8 +134,17 @@
                        (eq ?: (char-before (1- (point))))))
           (point)))))
 
+(defun rtags-ac-init ()
+  (unless rtags-diagnostics-process
+    (rtags-diagnostics)))
+
+(defun rtags-ac-completions-hook ()
+  (ac-start))
+
+(add-hook 'rtags-completions-hook 'rtags-ac-completions-hook)
+
 (ac-define-source rtags
-  '((init . rtags-diagnostics)
+  '((init . rtags-ac-init)
     (prefix . rtags-ac-prefix)
     (candidates . rtags-ac-candidates)
     (action . rtags-ac-action)

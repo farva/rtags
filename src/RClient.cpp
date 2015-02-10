@@ -14,104 +14,17 @@
    along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 
 #include "RClient.h"
-#include "CompileMessage.h"
+#include "IndexMessage.h"
 #include "LogOutputMessage.h"
 #include <rct/Connection.h>
 #include <rct/EventLoop.h>
 #include <rct/Log.h>
 #include <rct/Rct.h>
+#include "RTagsClang.h"
 #include <rct/RegExp.h>
 
-enum OptionType {
-    None = 0,
-    AbsolutePath,
-    AllReferences,
-    BuildIndex,
-    CheckReindex,
-    Clear,
-    CodeCompleteAt,
-    CompilationFlagsOnly,
-    CompilationFlagsSplitLine,
-    Compile,
-    ConnectTimeout,
-    ContainingFunction,
-    CurrentFile,
-    CursorInfo,
-    CursorInfoIncludeParents,
-    CursorInfoIncludeReferences,
-    CursorInfoIncludeTargets,
-    CursorKind,
-    DeclarationOnly,
-    DeleteProject,
-    Dependencies,
-    Diagnostics,
-    DisplayName,
-    DumpCompletions,
-    DumpFile,
-    DumpIncludeHeaders,
-    ElispList,
-    FilterSystemHeaders,
-    FindFile,
-    FindFilePreferExact,
-    FindProjectBuildRoot,
-    FindProjectRoot,
-    FindSymbols,
-    FindVirtuals,
-    FixIts,
-    FollowLocation,
-    HasFileManager,
-    Help,
-    IMenu,
-    IsIndexed,
-    IsIndexing,
-    JobCount,
-    ListSymbols,
-    LoadCompilationDatabase,
-    LogFile,
-    Man,
-    MatchCaseInsensitive,
-    MatchRegexp,
-    Max,
-    NoContext,
-    NoSortReferencesByInput,
-    NoUnescapeCompileCommands,
-    PathFilter,
-    PrepareCodeCompleteAt,
-    PreprocessFile,
-    Project,
-    ProjectRoot,
-    QuitRdm,
-    RTagsConfig,
-    RangeFilter,
-    RdmLog,
-    ReferenceLocation,
-    ReferenceName,
-    Reindex,
-    ReloadFileManager,
-    ReloadProjects,
-    RemoveFile,
-    ReverseSort,
-    SendDiagnostics,
-    Silent,
-    SilentQuery,
-    SocketFile,
-    Sources,
-    Status,
-    StripParen,
-    Suspend,
-    SyncProject,
-    SynchronousCompletions,
-    Timeout,
-    UnescapeCompileCommands,
-    UnloadProject,
-    UnsavedFile,
-    Verbose,
-    WildcardSymbolNames,
-    XmlDiagnostics
-};
-
 struct Option {
-    const OptionType option;
+    const RClient::OptionType option;
     const char *longOpt;
     const char shortOpt;
     const int argument;
@@ -123,109 +36,112 @@ struct Option {
 #define STR(s) XSTR(s)
 
 struct Option opts[] = {
-    { None, 0, 0, 0, "Options:" },
-    { Verbose, "verbose", 'v', no_argument, "Be more verbose." },
-    { Silent, "silent", 'Q', no_argument, "Be silent." },
-    { Help, "help", 'h', no_argument, "Display this help." },
+    { RClient::None, 0, 0, 0, "Options:" },
+    { RClient::Verbose, "verbose", 'v', no_argument, "Be more verbose." },
+    { RClient::Silent, "silent", 'Q', no_argument, "Be silent." },
+    { RClient::Help, "help", 'h', no_argument, "Display this help." },
 
-    { None, 0, 0, 0, "" },
-    { None, 0, 0, 0, "Rdm:" },
-    { QuitRdm, "quit-rdm", 'q', no_argument, "Tell server to shut down with optional exit code as argument." },
-    { ConnectTimeout, "connect-timeout", 0, required_argument, "Timeout for connecting to rdm in ms (default " STR(DEFAULT_CONNECT_TIMEOUT)  ")." },
+    { RClient::None, 0, 0, 0, "" },
+    { RClient::None, 0, 0, 0, "Rdm:" },
+    { RClient::QuitRdm, "quit-rdm", 'q', no_argument, "Tell server to shut down with optional exit code as argument." },
+    { RClient::ConnectTimeout, "connect-timeout", 0, required_argument, "Timeout for connecting to rdm in ms (default " STR(DEFAULT_CONNECT_TIMEOUT)  ")." },
 
-    { None, 0, 0, 0, "" },
-    { None, 0, 0, 0, "Project management:" },
-    { Clear, "clear", 'C', no_argument, "Clear projects." },
-    { Project, "project", 'w', optional_argument, "With arg, select project matching that if unique, otherwise list all projects." },
-    { DeleteProject, "delete-project", 'W', required_argument, "Delete all projects matching regexp." },
-    { UnloadProject, "unload", 'u', required_argument, "Unload project(s) matching argument." },
-    { ReloadProjects, "reload-projects", 'z', no_argument, "Reload projects from projects file." },
-    { JobCount, "jobcount", 'j', optional_argument, "Set or query current job count." },
-    { SyncProject, "syncproject", 0, no_argument, "Sync current project ASAP." },
+    { RClient::None, 0, 0, 0, "" },
+    { RClient::None, 0, 0, 0, "Project management:" },
+    { RClient::Clear, "clear", 'C', no_argument, "Clear projects." },
+    { RClient::Project, "project", 'w', optional_argument, "With arg, select project matching that if unique, otherwise list all projects." },
+    { RClient::DeleteProject, "delete-project", 'W', required_argument, "Delete all projects matching regexp." },
+    { RClient::UnloadProject, "unload", 'u', required_argument, "Unload project(s) matching argument." },
+    { RClient::ReloadProjects, "reload-projects", 'z', no_argument, "Reload projects from projects file." },
+    { RClient::JobCount, "jobcount", 'j', optional_argument, "Set or query current job count." },
+    { RClient::SyncProject, "syncproject", 0, no_argument, "Sync current project ASAP." },
 
-    { None, 0, 0, 0, "" },
-    { None, 0, 0, 0, "Indexing commands:" },
-    { Compile, "compile", 'c', optional_argument, "Pass compilation arguments to rdm." },
-#if defined(HAVE_CXCOMPILATIONDATABASE) && CLANG_VERSION_MINOR >= 3
-    { LoadCompilationDatabase, "load-compilation-database", 'J', optional_argument, "Load compile_commands.json from directory" },
+    { RClient::None, 0, 0, 0, "" },
+    { RClient::None, 0, 0, 0, "Indexing commands:" },
+    { RClient::Compile, "compile", 'c', optional_argument, "Pass compilation arguments to rdm." },
+#if CLANG_VERSION_MAJOR > 3 || (CLANG_VERSION_MAJOR == 3 && CLANG_VERSION_MINOR > 3)
+    { RClient::LoadCompilationDatabase, "load-compilation-database", 'J', optional_argument, "Load compile_commands.json from directory" },
 #endif
-    { Suspend, "suspend", 'X', optional_argument, "Dump suspended files (don't track changes in these files) with no arg. Otherwise toggle suspension for arg." },
+    { RClient::Suspend, "suspend", 'X', optional_argument, "Dump suspended files (don't track changes in these files) with no arg. Otherwise toggle suspension for arg." },
 
-    { None, 0, 0, 0, "" },
-    { None, 0, 0, 0, "Query commands:" },
-    { FollowLocation, "follow-location", 'f', required_argument, "Follow this location." },
-    { ReferenceName, "references-name", 'R', required_argument, "Find references matching arg." },
-    { ReferenceLocation, "references", 'r', required_argument, "Find references matching this location." },
-    { ListSymbols, "list-symbols", 'S', optional_argument, "List symbol names matching arg." },
-    { FindSymbols, "find-symbols", 'F', optional_argument, "Find symbols matching arg." },
-    { CursorInfo, "cursor-info", 'U', required_argument, "Get cursor info for this location." },
-    { Status, "status", 's', optional_argument, "Dump status of rdm. Arg can be symbols or symbolNames." },
-    { IsIndexed, "is-indexed", 'T', required_argument, "Check if rtags knows about, and is ready to return information about, this source file." },
-    { IsIndexing, "is-indexing", 0, no_argument, "Check if rtags is currently indexing files." },
-    { HasFileManager, "has-filemanager", 0, optional_argument, "Check if rtags has info about files in this directory." },
-    { PreprocessFile, "preprocess", 'E', required_argument, "Preprocess file." },
-    { Reindex, "reindex", 'V', optional_argument, "Reindex all files or all files matching pattern." },
-    { CheckReindex, "check-reindex", 'x', optional_argument, "Check if reindexing is necessary for all files matching pattern." },
-    { FindFile, "path", 'P', optional_argument, "Print files matching pattern." },
-    { DumpFile, "dump-file", 'd', required_argument, "Dump source file." },
-    { RdmLog, "rdm-log", 'g', no_argument, "Receive logs from rdm." },
-    { FixIts, "fixits", 0, required_argument, "Get fixits for file." },
-    { RemoveFile, "remove", 'D', required_argument, "Remove file from project." },
-    { FindProjectRoot, "find-project-root", 0, required_argument, "Use to check behavior of find-project-root." },
-    { FindProjectBuildRoot, "find-project-build-root", 0, required_argument, "Use to check behavior of find-project-root for builds." },
-    { Sources, "sources", 0, optional_argument, "Dump sources for source file." },
-    { Dependencies, "dependencies", 0, required_argument, "Dump dependencies for source file." },
-    { ReloadFileManager, "reload-file-manager", 'B', no_argument, "Reload file manager." },
-    { Man, "man", 0, no_argument, "Output XML for xmltoman to generate man page for rc :-)" },
-    { CodeCompleteAt, "code-complete-at", 'l', required_argument, "Code complete at location: arg is file:line:col." },
-    { PrepareCodeCompleteAt, "prepare-code-complete-at", 'b', required_argument, "Prepare code completion at location: arg is file:line:col." },
-    { SendDiagnostics, "send-diagnostics", 0, required_argument, "Only for debugging. Send data to all -g connections." },
-    { DumpCompletions, "dump-completions", 0, no_argument, "Dump cached completions." },
+    { RClient::None, 0, 0, 0, "" },
+    { RClient::None, 0, 0, 0, "Query commands:" },
+    { RClient::FollowLocation, "follow-location", 'f', required_argument, "Follow this location." },
+    { RClient::ReferenceName, "references-name", 'R', required_argument, "Find references matching arg." },
+    { RClient::ReferenceLocation, "references", 'r', required_argument, "Find references matching this location." },
+    { RClient::ListSymbols, "list-symbols", 'S', optional_argument, "List symbol names matching arg." },
+    { RClient::FindSymbols, "find-symbols", 'F', optional_argument, "Find symbols matching arg." },
+    { RClient::CursorInfo, "cursor-info", 'U', required_argument, "Get cursor info for this location." },
+    { RClient::Status, "status", 's', optional_argument, "Dump status of rdm. Arg can be symbols or symbolNames." },
+    { RClient::IsIndexed, "is-indexed", 'T', required_argument, "Check if rtags knows about, and is ready to return information about, this source file." },
+    { RClient::IsIndexing, "is-indexing", 0, no_argument, "Check if rtags is currently indexing files." },
+    { RClient::HasFileManager, "has-filemanager", 0, optional_argument, "Check if rtags has info about files in this directory." },
+    { RClient::PreprocessFile, "preprocess", 'E', required_argument, "Preprocess file." },
+    { RClient::Reindex, "reindex", 'V', optional_argument, "Reindex all files or all files matching pattern." },
+    { RClient::CheckReindex, "check-reindex", 'x', optional_argument, "Check if reindexing is necessary for all files matching pattern." },
+    { RClient::FindFile, "path", 'P', optional_argument, "Print files matching pattern." },
+    { RClient::DumpFile, "dump-file", 'd', required_argument, "Dump source file." },
+    { RClient::GenerateTest, "generate-test", 0, required_argument, "Generate a test for a given source file." },
+    { RClient::RdmLog, "rdm-log", 'g', no_argument, "Receive logs from rdm." },
+    { RClient::FixIts, "fixits", 0, required_argument, "Get fixits for file." },
+    { RClient::RemoveFile, "remove", 'D', required_argument, "Remove file from project." },
+    { RClient::FindProjectRoot, "find-project-root", 0, required_argument, "Use to check behavior of find-project-root." },
+    { RClient::FindProjectBuildRoot, "find-project-build-root", 0, required_argument, "Use to check behavior of find-project-root for builds." },
+    { RClient::Sources, "sources", 0, optional_argument, "Dump sources for source file." },
+    { RClient::Dependencies, "dependencies", 0, required_argument, "Dump dependencies for source file." },
+    { RClient::ReloadFileManager, "reload-file-manager", 'B', no_argument, "Reload file manager." },
+    { RClient::Man, "man", 0, no_argument, "Output XML for xmltoman to generate man page for rc :-)" },
+    { RClient::CodeCompleteAt, "code-complete-at", 'l', required_argument, "Code complete at location: arg is file:line:col." },
+    { RClient::PrepareCodeCompleteAt, "prepare-code-complete-at", 'b', required_argument, "Prepare code completion at location: arg is file:line:col." },
+    { RClient::SendDiagnostics, "send-diagnostics", 0, required_argument, "Only for debugging. Send data to all -g connections." },
+    { RClient::DumpCompletions, "dump-completions", 0, no_argument, "Dump cached completions." },
+    { RClient::DumpCompilationDatabase, "dump-compilation-database", 0, no_argument, "Dump compilation database for project." },
 
-    { None, 0, 0, 0, "" },
-    { None, 0, 0, 0, "Command flags:" },
-    { StripParen, "strip-paren", 'p', no_argument, "Strip parens in various contexts." },
-    { Max, "max", 'M', required_argument, "Max lines of output for queries." },
-    { ReverseSort, "reverse-sort", 'O', no_argument, "Sort output reversed." },
-    { UnsavedFile, "unsaved-file", 0, required_argument, "Pass unsaved file on command line. E.g. --unsaved-file=main.cpp:1200 then write 1200 bytes on stdin." },
-    { LogFile, "log-file", 'L', required_argument, "Log to this file." },
-    { NoContext, "no-context", 'N', no_argument, "Don't print context for locations." },
-    { PathFilter, "path-filter", 'i', required_argument, "Filter out results not matching with arg." },
-    { RangeFilter, "range-filter", 0, required_argument, "Filter out results not in the specified range." },
-    { FilterSystemHeaders, "filter-system-headers", 'H', no_argument, "Don't exempt system headers from path filters." },
-    { AllReferences, "all-references", 'e', no_argument, "Include definitions/declarations/constructors/destructors for references. Used for rename symbol." },
-    { ElispList, "elisp-list", 'Y', no_argument, "Output elisp: (list \"one\" \"two\" ...)." },
-    { Diagnostics, "diagnostics", 'G', no_argument, "Receive continual diagnostics from rdm." },
-    { XmlDiagnostics, "xml-diagnostics", 'm', no_argument, "Receive continual XML formatted diagnostics from rdm." },
-    { MatchRegexp, "match-regexp", 'Z', no_argument, "Treat various text patterns as regexps (-P, -i, -V)." },
-    { MatchCaseInsensitive, "match-icase", 'I', no_argument, "Match case insensitively" },
-    { AbsolutePath, "absolute-path", 'K', no_argument, "Print files with absolute path." },
-    { SocketFile, "socket-file", 'n', required_argument, "Use this socket file (default ~/.rdm)." },
-    { Timeout, "timeout", 'y', required_argument, "Max time in ms to wait for job to finish (default no timeout)." },
-    { FindVirtuals, "find-virtuals", 'k', no_argument, "Use in combinations with -R or -r to show other implementations of this function." },
-    { FindFilePreferExact, "find-file-prefer-exact", 'A', no_argument, "Use to make --find-file prefer exact matches over partial matches." },
-    { CursorInfoIncludeParents, "cursorinfo-include-parents", 0, no_argument, "Use to make --cursor-info include parent cursors." },
-    { CursorInfoIncludeTargets, "cursorinfo-include-targets", 0, no_argument, "Use to make --cursor-info include target cursors." },
-    { CursorInfoIncludeReferences, "cursorinfo-include-references", 0, no_argument, "Use to make --cursor-info include reference cursors." },
-    { CursorKind, "cursor-kind", 0, no_argument, "Include cursor kind in --find-symbols output." },
-    { DisplayName, "display-name", 0, no_argument, "Include display name in --find-symbols output." },
-    { CurrentFile, "current-file", 0, required_argument, "Pass along which file is being edited to give rdm a better chance at picking the right project." },
-    { DeclarationOnly, "declaration-only", 0, no_argument, "Filter out definitions (unless inline).", },
-    { IMenu, "imenu", 0, no_argument, "Use with --list-symbols to provide output for (rtags-imenu) (filter namespaces, fully qualified function names, ignore certain cursors etc)." },
-    { ContainingFunction, "containing-function", 'o', no_argument, "Include name of containing function in output."},
-    { BuildIndex, "build-index", 0, required_argument, "For sources with multiple builds, use the arg'th." },
-    { CompilationFlagsOnly, "compilation-flags-only", 0, no_argument, "For --source, only print compilation flags." },
-    { CompilationFlagsSplitLine, "compilation-flags-split-line", 0, no_argument, "For --source, print one compilation flag per line." },
-    { DumpIncludeHeaders, "dump-include-headers", 0, no_argument, "For --dump-file, also dump dependencies." },
-    { SilentQuery, "silent-query", 0, no_argument, "Don't log this request in rdm." },
-    { SynchronousCompletions, "synchronous-completions", 0, no_argument, "Wait for completion results." },
-    { UnescapeCompileCommands, "unescape-compile-commands", 0, no_argument, "Unescape \\'s and unquote arguments to -c." },
-    { NoUnescapeCompileCommands, "no-unescape-compile-commands", 0, no_argument, "Escape \\'s and unquote arguments to -c." },
-    { NoSortReferencesByInput, "no-sort-references-by-input", 0, no_argument, "Don't sort references by input position." },
-    { ProjectRoot, "project-root", 0, required_argument, "Override project root for compile commands." },
-    { RTagsConfig, "rtags-config", 0, required_argument, "Print out .rtags-config for argument." },
-    { WildcardSymbolNames, "wildcard-symbol-names", 'a', no_argument, "Expand * like wildcards in --list-symbols" },
-    { None, 0, 0, 0, 0 }
+    { RClient::None, 0, 0, 0, "" },
+    { RClient::None, 0, 0, 0, "Command flags:" },
+    { RClient::StripParen, "strip-paren", 'p', no_argument, "Strip parens in various contexts." },
+    { RClient::Max, "max", 'M', required_argument, "Max lines of output for queries." },
+    { RClient::ReverseSort, "reverse-sort", 'O', no_argument, "Sort output reversed." },
+    { RClient::UnsavedFile, "unsaved-file", 0, required_argument, "Pass unsaved file on command line. E.g. --unsaved-file=main.cpp:1200 then write 1200 bytes on stdin." },
+    { RClient::LogFile, "log-file", 'L', required_argument, "Log to this file." },
+    { RClient::NoContext, "no-context", 'N', no_argument, "Don't print context for locations." },
+    { RClient::PathFilter, "path-filter", 'i', required_argument, "Filter out results not matching with arg." },
+    { RClient::RangeFilter, "range-filter", 0, required_argument, "Filter out results not in the specified range." },
+    { RClient::FilterSystemHeaders, "filter-system-headers", 'H', no_argument, "Don't exempt system headers from path filters." },
+    { RClient::AllReferences, "all-references", 'e', no_argument, "Include definitions/declarations/constructors/destructors for references. Used for rename symbol." },
+    { RClient::ElispList, "elisp-list", 'Y', no_argument, "Output elisp: (list \"one\" \"two\" ...)." },
+    { RClient::Diagnostics, "diagnostics", 'G', no_argument, "Receive continual diagnostics from rdm." },
+    { RClient::XmlDiagnostics, "xml-diagnostics", 'm', no_argument, "Receive continual XML formatted diagnostics from rdm." },
+    { RClient::MatchRegexp, "match-regexp", 'Z', no_argument, "Treat various text patterns as regexps (-P, -i, -V)." },
+    { RClient::MatchCaseInsensitive, "match-icase", 'I', no_argument, "Match case insensitively" },
+    { RClient::AbsolutePath, "absolute-path", 'K', no_argument, "Print files with absolute path." },
+    { RClient::SocketFile, "socket-file", 'n', required_argument, "Use this socket file (default ~/.rdm)." },
+    { RClient::Timeout, "timeout", 'y', required_argument, "Max time in ms to wait for job to finish (default no timeout)." },
+    { RClient::FindVirtuals, "find-virtuals", 'k', no_argument, "Use in combinations with -R or -r to show other implementations of this function." },
+    { RClient::FindFilePreferExact, "find-file-prefer-exact", 'A', no_argument, "Use to make --find-file prefer exact matches over partial matches." },
+    { RClient::CursorInfoIncludeParents, "cursorinfo-include-parents", 0, no_argument, "Use to make --cursor-info include parent cursors." },
+    { RClient::CursorInfoIncludeTargets, "cursorinfo-include-targets", 0, no_argument, "Use to make --cursor-info include target cursors." },
+    { RClient::CursorInfoIncludeReferences, "cursorinfo-include-references", 0, no_argument, "Use to make --cursor-info include reference cursors." },
+    { RClient::CursorKind, "cursor-kind", 0, no_argument, "Include cursor kind in --find-symbols output." },
+    { RClient::DisplayName, "display-name", 0, no_argument, "Include display name in --find-symbols output." },
+    { RClient::CurrentFile, "current-file", 0, required_argument, "Pass along which file is being edited to give rdm a better chance at picking the right project." },
+    { RClient::DeclarationOnly, "declaration-only", 0, no_argument, "Filter out definitions (unless inline).", },
+    { RClient::IMenu, "imenu", 0, no_argument, "Use with --list-symbols to provide output for (rtags-imenu) (filter namespaces, fully qualified function names, ignore certain cursors etc)." },
+    { RClient::ContainingFunction, "containing-function", 'o', no_argument, "Include name of containing function in output."},
+    { RClient::BuildIndex, "build-index", 0, required_argument, "For sources with multiple builds, use the arg'th." },
+    { RClient::CompilationFlagsOnly, "compilation-flags-only", 0, no_argument, "For --source, only print compilation flags." },
+    { RClient::CompilationFlagsSplitLine, "compilation-flags-split-line", 0, no_argument, "For --source, print one compilation flag per line." },
+    { RClient::DumpIncludeHeaders, "dump-include-headers", 0, no_argument, "For --dump-file, also dump dependencies." },
+    { RClient::SilentQuery, "silent-query", 0, no_argument, "Don't log this request in rdm." },
+    { RClient::SynchronousCompletions, "synchronous-completions", 0, no_argument, "Wait for completion results." },
+    { RClient::UnescapeCompileCommands, "unescape-compile-commands", 0, no_argument, "Unescape \\'s and unquote arguments to -c." },
+    { RClient::NoUnescapeCompileCommands, "no-unescape-compile-commands", 0, no_argument, "Escape \\'s and unquote arguments to -c." },
+    { RClient::NoSortReferencesByInput, "no-sort-references-by-input", 0, no_argument, "Don't sort references by input position." },
+    { RClient::ProjectRoot, "project-root", 0, required_argument, "Override project root for compile commands." },
+    { RClient::RTagsConfig, "rtags-config", 0, required_argument, "Print out .rtags-config for argument." },
+    { RClient::WildcardSymbolNames, "wildcard-symbol-names", 'a', no_argument, "Expand * like wildcards in --list-symbols" },
+    { RClient::NoColor, "no-color", 0, no_argument, "Don't colorize context. " },
+    { RClient::None, 0, 0, 0, 0 }
 };
 
 static void help(FILE *f, const char* app)
@@ -398,7 +314,7 @@ public:
             escape = false;
             break;
         }
-        CompileMessage msg;
+        IndexMessage msg;
         msg.init(rc->argc(), rc->argv());
         msg.setWorkingDirectory(cwd);
         msg.setEscape(escape);
@@ -411,7 +327,7 @@ public:
     }
     virtual String description() const
     {
-        return ("CompileMessage " + cwd);
+        return ("IndexMessage " + cwd);
     }
 };
 
@@ -457,14 +373,14 @@ int RClient::exec()
     loop->init(EventLoop::MainEventLoop);
 
     const int commandCount = mCommands.size();
-    Connection connection;
+    Connection connection(NumOptions);
     connection.newMessage().connect(std::bind(&RClient::onNewMessage, this,
                                               std::placeholders::_1, std::placeholders::_2));
     connection.finished().connect(std::bind([](){ EventLoop::eventLoop()->quit(); }));
     connection.disconnected().connect(std::bind([](){ EventLoop::eventLoop()->quit(); }));
     if (!connection.connectUnix(mSocketFile, mConnectTimeout)) {
         error("Can't seem to connect to server");
-        return false;
+        return 1;
     }
     int ret = 0;
     for (int i=0; i<commandCount; ++i) {
@@ -572,8 +488,13 @@ bool RClient::parse(int &argc, char **argv)
         const Option *opt = (idx == -1 ? shortOptions.value(c) : longOptions.value(idx));
         assert(opt);
 
+        if (!isatty(STDOUT_FILENO)) {
+            mQueryFlags |= QueryMessage::NoColor;
+        }
+
         switch (opt->option) {
         case None:
+        case NumOptions:
             assert(0);
             break;
         case Help:
@@ -590,6 +511,9 @@ bool RClient::parse(int &argc, char **argv)
             break;
         case CompilationFlagsOnly:
             mQueryFlags |= QueryMessage::CompilationFlagsOnly;
+            break;
+        case NoColor:
+            mQueryFlags |= QueryMessage::NoColor;
             break;
         case CompilationFlagsSplitLine:
             mQueryFlags |= QueryMessage::CompilationFlagsSplitLine;
@@ -796,6 +720,9 @@ bool RClient::parse(int &argc, char **argv)
         case DumpCompletions:
             addQuery(QueryMessage::DumpCompletions);
             break;
+        case DumpCompilationDatabase:
+            addQuery(QueryMessage::DumpCompilationDatabase);
+            break;
         case ReloadProjects:
             addQuery(QueryMessage::ReloadProjects);
             break;
@@ -892,7 +819,7 @@ bool RClient::parse(int &argc, char **argv)
             }
             if (arg) {
                 Path p(arg);
-                if (p.exists()) {
+                if (c != FindFile && p.exists()) {
                     p.resolve();
                     addQuery(type, p, extraQueryFlags);
                 } else {
@@ -906,7 +833,7 @@ bool RClient::parse(int &argc, char **argv)
                 projectCommands.append(std::static_pointer_cast<QueryCommand>(mCommands.back()));
             break; }
         case LoadCompilationDatabase: {
-#if defined(HAVE_CXCOMPILATIONDATABASE) && CLANG_VERSION_MINOR >= 3
+#if CLANG_VERSION_MAJOR > 3 || (CLANG_VERSION_MAJOR == 3 && CLANG_VERSION_MINOR > 3)
             Path dir;
             if (optarg) {
                 dir = optarg;
@@ -921,8 +848,12 @@ bool RClient::parse(int &argc, char **argv)
                 return false;
             }
             if (!dir.isDir()) {
-                fprintf(stderr, "%s is not a directory\n", dir.constData());
-                return false;
+                if (dir.isFile() && dir.endsWith("/compile_commands.json")) {
+                    dir = dir.parentDir();
+                } else {
+                    fprintf(stderr, "%s is not a directory\n", dir.constData());
+                    return false;
+                }
             }
             if (!dir.endsWith('/'))
                 dir += '/';
@@ -1011,6 +942,7 @@ bool RClient::parse(int &argc, char **argv)
         case IsIndexed:
         case DumpFile:
         case Dependencies:
+        case GenerateTest:
         case FixIts: {
             Path p = optarg;
             if (!p.exists()) {
@@ -1029,8 +961,10 @@ bool RClient::parse(int &argc, char **argv)
                     p.append('/');
                 }
             }
+            p.resolve();
             QueryMessage::Type type = QueryMessage::Invalid;
             switch (opt->option) {
+            case GenerateTest: type = QueryMessage::GenerateTest; break;
             case Dependencies: type = QueryMessage::Dependencies; break;
             case FixIts: type = QueryMessage::FixIts; break;
             case DumpFile: type = QueryMessage::DumpFile; break;
@@ -1110,10 +1044,10 @@ bool RClient::parse(int &argc, char **argv)
     return true;
 }
 
-void RClient::onNewMessage(const Message *message, Connection *)
+void RClient::onNewMessage(const std::shared_ptr<Message> &message, Connection *)
 {
     if (message->messageId() == ResponseMessage::MessageId) {
-        const String response = static_cast<const ResponseMessage*>(message)->data();
+        const String response = std::static_pointer_cast<ResponseMessage>(message)->data();
         if (!response.isEmpty()) {
             fprintf(stdout, "%s\n", response.constData());
             fflush(stdout);

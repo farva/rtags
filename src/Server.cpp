@@ -16,27 +16,29 @@
 #include "Server.h"
 
 #include "CompletionThread.h"
-#include "CompileMessage.h"
+#include "IndexMessage.h"
 #include "LogOutputMessage.h"
 #include "CursorInfoJob.h"
 #include "DependenciesJob.h"
 #include "VisitFileResponseMessage.h"
 #include "Filter.h"
 #include "FindFileJob.h"
+#include "RClient.h"
 #include "FindSymbolsJob.h"
 #include "FollowLocationJob.h"
 #include "IndexerJob.h"
 #include "Source.h"
 #include "DumpThread.h"
 #include "DataFile.h"
-#if defined(HAVE_CXCOMPILATIONDATABASE)
-#  include <clang-c/CXCompilationDatabase.h>
+#if CLANG_VERSION_MAJOR > 3 || (CLANG_VERSION_MAJOR == 3 && CLANG_VERSION_MINOR > 3)
+#include <clang-c/CXCompilationDatabase.h>
 #endif
 #include "ListSymbolsJob.h"
 #include "LogObject.h"
 #include "Match.h"
 #include "Preprocessor.h"
 #include "Project.h"
+#include "JobScheduler.h"
 #include "QueryMessage.h"
 #include "VisitFileMessage.h"
 #include "IndexerMessage.h"
@@ -45,11 +47,11 @@
 #include "StatusJob.h"
 #include <clang-c/Index.h>
 #include <rct/Connection.h>
+#include <rct/Value.h>
 #include <rct/EventLoop.h>
 #include <rct/SocketClient.h>
 #include <rct/Log.h>
 #include <rct/Message.h>
-#include <rct/Messages.h>
 #include <rct/Path.h>
 #include <rct/Process.h>
 #include <rct/Rct.h>
@@ -57,6 +59,14 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <limits>
+
+#if not defined CLANG_INCLUDEPATH
+#error CLANG_INCLUDEPATH not defined during CMake generation
+#else
+#define TO_STR1(x) #x
+#define TO_STR(x)  TO_STR1(x)
+#define CLANG_INCLUDEPATH_STR TO_STR(CLANG_INCLUDEPATH)
+#endif
 
 class HttpLogObject : public LogOutput
 {
@@ -75,11 +85,10 @@ public:
             String message(msg, len);
             SocketClient::WeakPtr weak = mSocket;
 
-            EventLoop::eventLoop()->callLater(std::bind([message,weak,this] {
-                        // ### I don't understand why I need to capture this
-                        // ### here (especially since this potentially could
-                        // ### have been destroyed but it doesn't compile
-                        // ### otherwise.
+            EventLoop::eventLoop()->callLater(std::bind([message, weak, this] {
+                        // ### At some point (with some version of GCC) this
+                        // ### lambda wouldn't compile unless "this" was
+                        // ### captured.
                         if (SocketClient::SharedPtr socket = weak.lock()) {
                             HttpLogObject::send(message.constData(), message.size(), socket);
                         }
@@ -119,69 +128,34 @@ Server::~Server()
         mCompletionThread = 0;
     }
 
-    for (const auto &job : mActiveJobs) {
-        if (Process *process = job.second->process) {
-            process->kill();
-        }
-    }
-
     stopServers();
+    for (const auto project : mProjects) {
+        project.second->unload();
+        // need to save updated Source::Enabled
+    }
     mProjects.clear(); // need to be destroyed before sInstance is set to 0
     assert(sInstance == this);
     sInstance = 0;
-    Messages::cleanup();
+    Message::cleanup();
 }
-
-#if not defined CLANG_INCLUDEPATH
-#error CLANG_INCLUDEPATH not defined during CMake generation
-#else
-#define TO_STR1(x) #x
-#define TO_STR(x)  TO_STR1(x)
-#define CLANG_INCLUDEPATH_STR TO_STR(CLANG_INCLUDEPATH)
-#endif
 
 bool Server::init(const Options &options)
 {
     RTags::initMessages();
 
     mOptions = options;
-    mSuspended = (options.options & StartSuspended);
-    Path clangPath = Path::resolved(CLANG_INCLUDEPATH_STR);
-    mOptions.includePaths.append(Source::Include(Source::Include::Type_System, clangPath));
-#ifdef OS_Darwin
-    if (clangPath.exists()) {
-        Path cppClangPath = clangPath + "../../../c++/v1/";
-        cppClangPath.resolve();
-        if (cppClangPath.isDir()) {
-            mOptions.includePaths.append(Source::Include(Source::Include::Type_System, cppClangPath));
-        } else {
-            cppClangPath = clangPath + "../../../../include/c++/v1/";
-            cppClangPath.resolve();
-            if (cppClangPath.isDir()) {
-                mOptions.includePaths.append(Source::Include(Source::Include::Type_System, cppClangPath));
-            } else {
-                error("Unable to find libc++ include path (.../c++/v1) near " CLANG_INCLUDEPATH_STR );
-                return false;
-            }
-        }
-        // this seems to be the only way we get things like cstdint
-    }
-#endif
-
-    if (!(options.options & NoUnlimitedErrors))
+    mSuspended = (options.flag(StartSuspended));
+    if (!(options.flag(NoUnlimitedErrors)))
         mOptions.defaultArguments << "-ferror-limit=0";
-    if (options.options & Wall)
+    if (options.flag(Wall))
         mOptions.defaultArguments << "-Wall";
-    if (options.options & SpellChecking)
+    if (options.flag(SpellChecking))
         mOptions.defaultArguments << "-fspell-checking";
-    if (!(options.options & NoNoUnknownWarningsOption))
+    if (!(options.flag(NoNoUnknownWarningsOption)))
         mOptions.defaultArguments.append("-Wno-unknown-warning-option");
+
     if (mOptions.options & EnableCompilerManager) {
-        mOptions.defaultArguments << "-nobuiltininc";
-        mOptions.defaultArguments << "-nostdinc++";
-        mOptions.defaultArguments << "-mno-sse";
-        mOptions.defaultArguments << "-mno-sse2";
-        mOptions.defaultArguments << "-mno-sse3";
+#ifndef OS_Darwin   // this causes problems on MacOS+clang
         // http://clang.llvm.org/compatibility.html#vector_builtins
         const char *gccBuiltIntVectorFunctionDefines[] = {
             "__builtin_ia32_rolhi",
@@ -200,6 +174,10 @@ bool Server::init(const Options &options)
         for (int i=0; gccBuiltIntVectorFunctionDefines[i]; ++i) {
             mOptions.defines << Source::Define(String::format<128>("%s(...)", gccBuiltIntVectorFunctionDefines[i]));
         }
+#endif
+    } else {
+        const Path clangPath = Path::resolved(CLANG_INCLUDEPATH_STR);
+        mOptions.includePaths.append(Source::Include(Source::Include::Type_System, clangPath));
     }
 
     Log l(Error);
@@ -215,13 +193,14 @@ bool Server::init(const Options &options)
 
     for (int i=0; i<10; ++i) {
         mUnixServer.reset(new SocketServer);
+        warning() << "listening" << mOptions.socketFile;
         if (mUnixServer->listen(mOptions.socketFile)) {
             break;
         }
         mUnixServer.reset();
         if (!i) {
             enum { Timeout = 1000 };
-            Connection connection;
+            Connection connection(RClient::NumOptions);
             if (connection.connectUnix(mOptions.socketFile, Timeout)) {
                 connection.send(QueryMessage(QueryMessage::Shutdown));
                 connection.disconnected().connect(std::bind([](){ EventLoop::eventLoop()->quit(); }));
@@ -237,6 +216,8 @@ bool Server::init(const Options &options)
         error("Unable to listen on %s", mOptions.socketFile.constData());
         return false;
     }
+
+    mJobScheduler.reset(new JobScheduler(mOptions.jobCount));
 
     restoreFileIds();
     mUnixServer->newConnection().connect(std::bind(&Server::onNewConnection, this, std::placeholders::_1));
@@ -314,7 +295,7 @@ void Server::onNewConnection(SocketServer *server)
         SocketClient::SharedPtr client = server->nextConnection();
         if (!client)
             break;
-        Connection *conn = new Connection(client);
+        Connection *conn = new Connection(client, RClient::NumOptions);
         conn->newMessage().connect(std::bind(&Server::onNewMessage, this, std::placeholders::_1, std::placeholders::_2));
         conn->disconnected().connect(std::bind([conn]() {
                     conn->disconnected().disconnect();
@@ -323,34 +304,34 @@ void Server::onNewConnection(SocketServer *server)
     }
 }
 
-void Server::onNewMessage(Message *message, Connection *connection)
+void Server::onNewMessage(const std::shared_ptr<Message> &message, Connection *connection)
 {
     if (mOptions.unloadTimer)
         mUnloadTimer.restart(mOptions.unloadTimer * 1000 * 60, Timer::SingleShot);
 
-    RTagsMessage *m = static_cast<RTagsMessage*>(message);
+    std::shared_ptr<RTagsMessage> m = std::static_pointer_cast<RTagsMessage>(message);
 
     switch (message->messageId()) {
-    case CompileMessage::MessageId:
-        handleCompileMessage(static_cast<CompileMessage&>(*m), connection);
+    case IndexMessage::MessageId:
+        handleIndexMessage(std::static_pointer_cast<IndexMessage>(m), connection);
         break;
     case QueryMessage::MessageId:
-        handleQueryMessage(static_cast<const QueryMessage&>(*m), connection);
+        handleQueryMessage(std::static_pointer_cast<QueryMessage>(m), connection);
         break;
     case IndexerMessage::MessageId:
-        handleIndexerMessage(static_cast<const IndexerMessage&>(*m), connection);
+        handleIndexerMessage(std::static_pointer_cast<IndexerMessage>(m), connection);
         break;
     case LogOutputMessage::MessageId:
         error() << m->raw();
-        handleLogOutputMessage(static_cast<const LogOutputMessage&>(*m), connection);
+        handleLogOutputMessage(std::static_pointer_cast<LogOutputMessage>(m), connection);
         break;
     case VisitFileMessage::MessageId:
-        handleVisitFileMessage(static_cast<const VisitFileMessage&>(*m), connection);
+        handleVisitFileMessage(std::static_pointer_cast<VisitFileMessage>(m), connection);
         break;
     case ResponseMessage::MessageId:
     case FinishMessage::MessageId:
     case VisitFileResponseMessage::MessageId:
-        error() << getpid() << "Unexpected message" << static_cast<int>(message->messageId());
+        error() << "Unexpected message" << static_cast<int>(message->messageId());
         // assert(0);
         connection->finish(1);
         break;
@@ -366,14 +347,30 @@ void Server::onNewMessage(Message *message, Connection *connection)
     }
 }
 
-bool Server::index(const String &arguments, const Path &pwd, const Path &projectRootOverride, bool escape)
+bool Server::index(const String &arguments, const Path &pwd, const Path &projectRootOverride, unsigned int flags)
 {
-    Path unresolvedPath;
-    unsigned int flags = Source::None;
-    if (escape)
-        flags |= Source::Escape;
     List<Path> unresolvedPaths;
-    List<Source> sources = Source::parse(arguments, pwd, flags, &unresolvedPaths);
+    List<Source> sources;
+    bool parse = true;
+    if (!mOptions.argTransform.isEmpty()) {
+        Process process;
+        if (process.exec(mOptions.argTransform, List<String>() << arguments) == Process::Done) {
+            if (process.returnCode() != 0) {
+                warning() << "--arg-transform returned" << process.returnCode() << "for" << arguments;
+                return false;
+            }
+            const String stdOut = process.readAllStdOut();
+            if (stdOut != arguments) {
+                warning() << "Changed\n" << arguments << "\nto\n" << stdOut;
+                parse = false;
+                sources = Source::parse(stdOut, pwd, flags, &unresolvedPaths);
+            }
+        }
+    }
+
+    if (parse)
+        sources = Source::parse(arguments, pwd, flags, &unresolvedPaths);
+
     bool ret = false;
     int idx = 0;
     for (Source &source : sources) {
@@ -418,16 +415,18 @@ bool Server::index(const String &arguments, const Path &pwd, const Path &project
     return ret;
 }
 
-void Server::handleCompileMessage(CompileMessage &message, Connection *conn)
+void Server::handleIndexMessage(const std::shared_ptr<IndexMessage> &message, Connection *conn)
 {
-#if defined(HAVE_CXCOMPILATIONDATABASE) && CLANG_VERSION_MINOR >= 3
-    const Path path = message.compilationDatabaseDir();
+#if CLANG_VERSION_MAJOR > 3 || (CLANG_VERSION_MAJOR == 3 && CLANG_VERSION_MINOR > 3)
+    const Path path = message->compilationDatabaseDir();
     if (!path.isEmpty()) {
         CXCompilationDatabase_Error err;
         CXCompilationDatabase db = clang_CompilationDatabase_fromDirectory(path.constData(), &err);
         if (err != CXCompilationDatabase_NoError) {
-            conn->write("Can't load compilation database");
-            conn->finish();
+            if (conn) {
+                conn->write("Can't load compilation database");
+                conn->finish();
+            }
             return;
         }
         CXCompileCommands cmds = clang_CompilationDatabase_getAllCompileCommands(db);
@@ -447,60 +446,42 @@ void Server::handleCompileMessage(CompileMessage &message, Connection *conn)
                     args += " ";
             }
 
-            index(args, dir, message.projectRoot(), message.escape());
+            index(args, dir, message->projectRoot(), message->escape() ? Source::Escape : Source::None);
         }
         clang_CompileCommands_dispose(cmds);
         clang_CompilationDatabase_dispose(db);
-        conn->write("[Server] Compilation database loaded");
-        conn->finish();
+        if (conn) {
+            conn->write("[Server] Compilation database loaded");
+            conn->finish();
+        }
         return;
     }
 #endif
-    const bool ret = index(message.arguments(), message.workingDirectory(),
-                           message.projectRoot(), message.escape());
-    conn->finish(ret ? 0 : 1);
+    const bool ret = index(message->arguments(), message->workingDirectory(),
+                           message->projectRoot(), message->escape() ? Source::Escape : Source::None);
+    if (conn)
+        conn->finish(ret ? 0 : 1);
 }
 
-void Server::handleLogOutputMessage(const LogOutputMessage &message, Connection *conn)
+void Server::handleLogOutputMessage(const std::shared_ptr<LogOutputMessage> &message, Connection *conn)
 {
-    new LogObject(conn, message.level());
+    new LogObject(conn, message->level());
 }
 
-void Server::handleIndexerMessage(const IndexerMessage &message, Connection *conn)
+void Server::handleIndexerMessage(const std::shared_ptr<IndexerMessage> &message, Connection *conn)
 {
-    std::shared_ptr<IndexData> indexData = message.data();
-    // error() << "Got indexer message" << message.project() << Location::path(indexData->fileId());
-    assert(indexData);
-    auto it = mActiveJobs.find(indexData->pid);
-    if (it != mActiveJobs.end()) {
-        std::shared_ptr<IndexerJob> job = it->second;
-        assert(job);
-        mActiveJobs.erase(it);
-
-        job->flags &= ~IndexerJob::Running;
-
-        // we only care about the first job that returns
-        if (!(job->flags & IndexerJob::Complete)) {
-            if (!(job->flags & IndexerJob::Aborted))
-                job->flags |= IndexerJob::Complete;
-            std::shared_ptr<Project> project = mProjects.value(message.project());
-            if (!project) {
-                error() << "Can't find project root for this IndexerMessage" << message.project() << Location::path(indexData->fileId());
-            } else {
-                project->onJobFinished(indexData, job);
-            }
-        }
-    }
+    mJobScheduler->handleIndexerMessage(message);
     conn->finish();
+    mIndexerMessageReceived();
 }
 
-void Server::handleQueryMessage(const QueryMessage &message, Connection *conn)
+void Server::handleQueryMessage(const std::shared_ptr<QueryMessage> &message, Connection *conn)
 {
-    if (!(message.flags() & QueryMessage::SilentQuery))
-        error() << message.raw();
-    conn->setSilent(message.flags() & QueryMessage::Silent);
+    if (!(message->flags() & QueryMessage::SilentQuery))
+        error() << message->raw();
+    conn->setSilent(message->flags() & QueryMessage::Silent);
 
-    switch (message.type()) {
+    switch (message->type()) {
     case QueryMessage::Invalid:
         assert(0);
         break;
@@ -510,8 +491,14 @@ void Server::handleQueryMessage(const QueryMessage &message, Connection *conn)
     case QueryMessage::Sources:
         sources(message, conn);
         break;
+    case QueryMessage::GenerateTest:
+        generateTest(message, conn);
+        break;
     case QueryMessage::DumpCompletions:
         dumpCompletions(message, conn);
+        break;
+    case QueryMessage::DumpCompilationDatabase:
+        dumpCompilationDatabase(message, conn);
         break;
     case QueryMessage::SendDiagnostics:
         sendDiagnostics(message, conn);
@@ -602,9 +589,9 @@ void Server::handleQueryMessage(const QueryMessage &message, Connection *conn)
     }
 }
 
-void Server::followLocation(const QueryMessage &query, Connection *conn)
+void Server::followLocation(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Location loc = query.location();
+    const Location loc = query->location();
     if (loc.isNull()) {
         conn->write("Not indexed");
         conn->finish(1);
@@ -662,7 +649,7 @@ void Server::followLocation(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::isIndexing(const QueryMessage &, Connection *conn)
+void Server::isIndexing(const std::shared_ptr<QueryMessage> &, Connection *conn)
 {
     for (const auto &it : mProjects) {
         if (it.second->isIndexing()) {
@@ -675,10 +662,10 @@ void Server::isIndexing(const QueryMessage &, Connection *conn)
     conn->finish();
 }
 
-void Server::removeFile(const QueryMessage &query, Connection *conn)
+void Server::removeFile(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    // Path path = query.path();
-    const Match match = query.match();
+    // Path path = query->path();
+    const Match match = query->match();
     std::shared_ptr<Project> project = projectForQuery(query);
     if (!project)
         project = currentProject();
@@ -694,7 +681,7 @@ void Server::removeFile(const QueryMessage &query, Connection *conn)
     }
 
     const int count = project->remove(match);
-    // error() << count << query.query();
+    // error() << count << query->query();
     if (count) {
         conn->write<128>("Removed %d files", count);
     } else {
@@ -703,7 +690,7 @@ void Server::removeFile(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::findFile(const QueryMessage &query, Connection *conn)
+void Server::findFile(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     std::shared_ptr<Project> project = currentProject();
     if (!project || project->state() == Project::Unloaded) {
@@ -717,23 +704,23 @@ void Server::findFile(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::dumpFile(const QueryMessage &query, Connection *conn)
+void Server::dumpFile(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const uint32_t fileId = Location::fileId(query.query());
+    const uint32_t fileId = Location::fileId(query->query());
     if (!fileId) {
-        conn->write<256>("%s is not indexed", query.query().constData());
+        conn->write<256>("%s is not indexed", query->query().constData());
         conn->finish();
         return;
     }
 
     std::shared_ptr<Project> project = projectForQuery(query);
     if (!project || project->state() != Project::Loaded) {
-        conn->write<256>("%s is not indexed", query.query().constData());
+        conn->write<256>("%s is not indexed", query->query().constData());
         conn->finish();
         return;
     }
 
-    const Source source = project->sources(fileId).value(query.buildIndex());
+    const Source source = project->sources(fileId).value(query->buildIndex());
     if (!source.isNull()) {
         conn->disconnected().disconnect();
         // ### this is a hack, but if the connection goes away we can't post
@@ -742,14 +729,90 @@ void Server::dumpFile(const QueryMessage &query, Connection *conn)
         DumpThread *dumpThread = new DumpThread(query, source, conn);
         dumpThread->start(Thread::Normal, 8 * 1024 * 1024); // 8MiB stack size
     } else {
-        conn->write<256>("%s build: %d not found", query.query().constData(), query.buildIndex());
+        conn->write<256>("%s build: %d not found", query->query().constData(), query->buildIndex());
         conn->finish();
     }
 }
 
-void Server::cursorInfo(const QueryMessage &query, Connection *conn)
+void Server::generateTest(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Location loc = query.location();
+    const uint32_t fileId = Location::fileId(query->query());
+    if (!fileId) {
+        conn->write<256>("%s is not indexed", query->query().constData());
+        conn->finish();
+        return;
+    }
+
+    std::shared_ptr<Project> project = projectForQuery(query);
+    if (!project || project->state() != Project::Loaded) {
+        conn->write<256>("%s is not indexed", query->query().constData());
+        conn->finish();
+        return;
+    }
+
+    const Source source = project->sources(fileId).value(query->buildIndex());
+    if (!source.isNull()) {
+        enum CommandLineMode {
+            IncludeCompiler = 0x001,
+            IncludeSourceFile = 0x002,
+            IncludeDefines = 0x004,
+            IncludeIncludepaths = 0x008,
+            QuoteDefines = 0x010,
+            FilterBlacklist = 0x020,
+            ExcludeDefaultArguments = 0x040,
+            ExcludeDefaultIncludePaths = 0x080,
+            ExcludeDefaultDefines = 0x100,
+            Default = IncludeDefines|IncludeIncludepaths|FilterBlacklist
+        };
+
+        const unsigned int flags = (Source::Default
+                                    |Source::ExcludeDefaultDefines
+                                    |Source::ExcludeDefaultIncludePaths
+                                    |Source::ExcludeDefaultArguments);
+
+        const Path root = source.sourceFile().parentDir().ensureTrailingSlash();
+        List<String> compile = source.toCommandLine(flags);
+        for (auto &ref : compile) {
+            const int idx = ref.indexOf(root);
+            if (idx != -1)
+                ref.remove(idx, root.size());
+        }
+        compile.append(source.sourceFile().fileName());
+
+        Value out;
+        out["sources"] = (List<Value>() << String::join(compile, ' '));
+
+        List<Value> tests;
+
+        const SymbolMap &map = project->symbols();
+        List<Value> noContextFlags;
+        noContextFlags.append("no-context");
+        auto it = map.lower_bound(Location(source.fileId, 0, 0));
+        while (it != map.end() && it->first.fileId() == source.fileId) {
+            Location loc;
+            if (it->second->bestTarget(map, &loc) && loc.fileId() == source.fileId) {
+                Map<String, Value> test;
+                test["type"] = "follow-location";
+                test["flags"] = noContextFlags;
+                test["location"] = String::format<128>("%s:%d:%d:", it->first.path().fileName(), it->first.line(), it->first.column());
+                List<Value> output;
+                output.append(String::format<128>("%s:%d:%d:", loc.path().fileName(), loc.line(), loc.column()));
+                test["output"] = output;
+                tests.append(test);
+            }
+            ++it;
+        }
+        out["tests"] = tests;
+        conn->finish(out.toJSON(true));
+    } else {
+        conn->write<256>("%s build: %d not found", query->query().constData(), query->buildIndex());
+        conn->finish();
+    }
+}
+
+void Server::cursorInfo(const std::shared_ptr<QueryMessage> &query, Connection *conn)
+{
+    const Location loc = query->location();
     if (loc.isNull()) {
         conn->finish();
         return;
@@ -768,7 +831,7 @@ void Server::cursorInfo(const QueryMessage &query, Connection *conn)
     }
 }
 
-void Server::dependencies(const QueryMessage &query, Connection *conn)
+void Server::dependencies(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     std::shared_ptr<Project> project = projectForQuery(query);
     if (!project) {
@@ -785,20 +848,20 @@ void Server::dependencies(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::fixIts(const QueryMessage &query, Connection *conn)
+void Server::fixIts(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     std::shared_ptr<Project> project = projectForQuery(query);
     if (project && project->state() == Project::Loaded) {
-        String out = project->fixIts(Location::fileId(query.query()));
+        String out = project->fixIts(Location::fileId(query->query()));
         if (!out.isEmpty())
             conn->write(out);
     }
     conn->finish();
 }
 
-void Server::referencesForLocation(const QueryMessage &query, Connection *conn)
+void Server::referencesForLocation(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Location loc = query.location();
+    const Location loc = query->location();
     if (loc.isNull()) {
         conn->write("Not indexed");
         conn->finish();
@@ -821,9 +884,9 @@ void Server::referencesForLocation(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::referencesForName(const QueryMessage& query, Connection *conn)
+void Server::referencesForName(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const String name = query.query();
+    const String name = query->query();
 
     std::shared_ptr<Project> project = currentProject();
 
@@ -842,9 +905,9 @@ void Server::referencesForName(const QueryMessage& query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::findSymbols(const QueryMessage &query, Connection *conn)
+void Server::findSymbols(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const String partial = query.query();
+    const String partial = query->query();
 
     std::shared_ptr<Project> project = currentProject();
 
@@ -863,9 +926,9 @@ void Server::findSymbols(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::listSymbols(const QueryMessage &query, Connection *conn)
+void Server::listSymbols(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const String partial = query.query();
+    const String partial = query->query();
 
     std::shared_ptr<Project> project = currentProject();
     if (!project) {
@@ -879,7 +942,7 @@ void Server::listSymbols(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::status(const QueryMessage &query, Connection *conn)
+void Server::status(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     std::shared_ptr<Project> project = currentProject();
 
@@ -900,10 +963,10 @@ void Server::status(const QueryMessage &query, Connection *conn)
     conn->finish(ret);
 }
 
-void Server::isIndexed(const QueryMessage &query, Connection *conn)
+void Server::isIndexed(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     String ret = "unknown";
-    const Match match = query.match();
+    const Match match = query->match();
     std::shared_ptr<Project> project = projectForQuery(query);
     if (project) {
         bool indexed = false;
@@ -911,13 +974,13 @@ void Server::isIndexed(const QueryMessage &query, Connection *conn)
             ret = indexed ? "indexed" : "managed";
     }
 
-    if (!(query.flags() & QueryMessage::SilentQuery))
+    if (!(query->flags() & QueryMessage::SilentQuery))
         error("=> %s", ret.constData());
     conn->write(ret);
     conn->finish();
 }
 
-void Server::reloadFileManager(const QueryMessage &, Connection *conn)
+void Server::reloadFileManager(const std::shared_ptr<QueryMessage> &, Connection *conn)
 {
     std::shared_ptr<Project> project = currentProject();
     if (project) {
@@ -930,25 +993,25 @@ void Server::reloadFileManager(const QueryMessage &, Connection *conn)
     }
 }
 
-void Server::hasFileManager(const QueryMessage &query, Connection *conn)
+void Server::hasFileManager(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Path path = query.query();
+    const Path path = query->query();
     std::shared_ptr<Project> project = projectForQuery(query);
-    if (project && project->fileManager && (project->fileManager->contains(path) || project->match(query.match()))) {
-        if (!(query.flags() & QueryMessage::SilentQuery))
+    if (project && project->fileManager && (project->fileManager->contains(path) || project->match(query->match()))) {
+        if (!(query->flags() & QueryMessage::SilentQuery))
             error("=> 1");
         conn->write("1");
     } else {
-        if (!(query.flags() & QueryMessage::SilentQuery))
+        if (!(query->flags() & QueryMessage::SilentQuery))
             error("=> 0");
         conn->write("0");
     }
     conn->finish();
 }
 
-void Server::preprocessFile(const QueryMessage &query, Connection *conn)
+void Server::preprocessFile(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Path path = query.query();
+    const Path path = query->query();
     std::shared_ptr<Project> project = projectForQuery(query);
     if (!project) {
         conn->write("No project");
@@ -961,9 +1024,9 @@ void Server::preprocessFile(const QueryMessage &query, Connection *conn)
     }
 
     const uint32_t fileId = Location::fileId(path);
-    const Source source = project->sources(fileId).value(query.buildIndex());
+    const Source source = project->sources(fileId).value(query->buildIndex());
     if (!source.isValid()) {
-        conn->write<256>("%s build: %d not found", query.query().constData(), query.buildIndex());
+        conn->write<256>("%s build: %d not found", query->query().constData(), query->buildIndex());
         conn->finish();
     } else {
         Preprocessor *pre = new Preprocessor(source, conn);
@@ -980,9 +1043,9 @@ void Server::clearProjects()
     mProjects.clear();
 }
 
-void Server::reindex(const QueryMessage &query, Connection *conn)
+void Server::reindex(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    Match match = query.match();
+    Match match = query->match();
     std::shared_ptr<Project> project = projectForQuery(query);
     if (!project) {
         project = currentProject();
@@ -998,7 +1061,7 @@ void Server::reindex(const QueryMessage &query, Connection *conn)
     }
 
     const int count = project->reindex(match, query);
-    // error() << count << query.query();
+    // error() << count << query->query();
     if (count) {
         conn->write<128>("Dirtied %d files", count);
     } else {
@@ -1026,22 +1089,8 @@ bool Server::shouldIndex(const Source &source, const Path &srcRoot) const
         return false;
     }
 
-    std::shared_ptr<Project> project = mProjects.value(srcRoot);
-    if (project && project->hasSource(source)) {
-        warning() << "Shouldn't index" << source.sourceFile() << "because we already have indexed it";
-        return false;
-    }
     return true;
 }
-
-// void Server::index(const std::shared_ptr<Unit> &unit, const std::shared_ptr<Project> &project)
-// {
-//     warning() << "Indexing" << source << "in" << project->path();
-//     if (!currentProject())
-//         setCurrentProject(project);
-//     assert(project);
-//     project->index(unit);
-// }
 
 void Server::setCurrentProject(const std::shared_ptr<Project> &project, unsigned int queryFlags)
 {
@@ -1082,15 +1131,15 @@ void Server::setCurrentProject(const std::shared_ptr<Project> &project, unsigned
     }
 }
 
-std::shared_ptr<Project> Server::projectForQuery(const QueryMessage &query)
+std::shared_ptr<Project> Server::projectForQuery(const std::shared_ptr<QueryMessage> &query)
 {
     Match matches[2];
-    if (query.flags() & QueryMessage::HasLocation) {
-        matches[0] = query.location().path();
+    if (query->flags() & QueryMessage::HasLocation) {
+        matches[0] = query->location().path();
     } else {
-        matches[0] = query.match();
+        matches[0] = query->match();
     }
-    matches[1] = query.currentFile();
+    matches[1] = query->currentFile();
     std::shared_ptr<Project> cur = currentProject();
     // give current a chance first to avoid switching project when using system headers etc
     for (int i=0; i<2; ++i) {
@@ -1100,7 +1149,7 @@ std::shared_ptr<Project> Server::projectForQuery(const QueryMessage &query)
 
         for (const auto &it : mProjects) {
             if (it.second != cur && it.second->match(match)) {
-                setCurrentProject(it.second, query.flags());
+                setCurrentProject(it.second, query->flags());
                 return it.second;
             }
         }
@@ -1108,11 +1157,11 @@ std::shared_ptr<Project> Server::projectForQuery(const QueryMessage &query)
     return std::shared_ptr<Project>();
 }
 
-void Server::removeProject(const QueryMessage &query, Connection *conn)
+void Server::removeProject(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const bool unload = query.type() == QueryMessage::UnloadProject;
+    const bool unload = query->type() == QueryMessage::UnloadProject;
 
-    const Match match = query.match();
+    const Match match = query->match();
     auto it = mProjects.begin();
     bool found = false;
     while (it != mProjects.end()) {
@@ -1138,7 +1187,7 @@ void Server::removeProject(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::reloadProjects(const QueryMessage &query, Connection *conn)
+void Server::reloadProjects(const std::shared_ptr<QueryMessage> &/*query*/, Connection *conn)
 {
     const int old = mProjects.size();
     const int cur = reloadProjects();
@@ -1146,9 +1195,9 @@ void Server::reloadProjects(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::project(const QueryMessage &query, Connection *conn)
+void Server::project(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    if (query.query().isEmpty()) {
+    if (query->query().isEmpty()) {
         const std::shared_ptr<Project> current = currentProject();
         const char *states[] = { "(unloaded)", "(inited)", "(loading)", "(loaded)", "(syncing)" };
         for (const auto &it : mProjects) {
@@ -1157,10 +1206,10 @@ void Server::project(const QueryMessage &query, Connection *conn)
     } else {
         std::shared_ptr<Project> selected;
         bool error = false;
-        const Match match = query.match();
+        const Match match = query->match();
         const auto it = mProjects.find(match.pattern());
         bool ok = false;
-        unsigned long long index = query.query().toULongLong(&ok);
+        unsigned long long index = query->query().toULongLong(&ok);
         if (it != mProjects.end()) {
             selected = it->second;
         } else {
@@ -1204,37 +1253,38 @@ void Server::project(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::jobCount(const QueryMessage &query, Connection *conn)
+void Server::jobCount(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    if (query.query().isEmpty()) {
+    if (query->query().isEmpty()) {
         conn->write<128>("Running with %d jobs", mOptions.jobCount);
     } else {
-        const int jobCount = query.query().toLongLong();
+        const int jobCount = query->query().toLongLong();
         if (jobCount < 0 || jobCount > 100) {
-            conn->write<128>("Invalid job count %s (%d)", query.query().constData(), jobCount);
+            conn->write<128>("Invalid job count %s (%d)", query->query().constData(), jobCount);
         } else {
             mOptions.jobCount = jobCount;
+            mJobScheduler->setMaxJobs(jobCount);
             conn->write<128>("Changed jobs to %d", jobCount);
         }
     }
     conn->finish();
 }
 
-void Server::sendDiagnostics(const QueryMessage &query, Connection *conn)
+void Server::sendDiagnostics(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
     if (testLog(RTags::CompilationErrorXml))
-        logDirect(RTags::CompilationErrorXml, query.query());
+        logDirect(RTags::CompilationErrorXml, query->query());
     conn->finish();
 }
 
-void Server::clearProjects(const QueryMessage &query, Connection *conn)
+void Server::clearProjects(const std::shared_ptr<QueryMessage> &/*query*/, Connection *conn)
 {
     clearProjects();
     conn->write("Cleared projects");
     conn->finish();
 }
 
-void Server::shutdown(const QueryMessage &query, Connection *conn)
+void Server::shutdown(const std::shared_ptr<QueryMessage> &/*query*/, Connection *conn)
 {
     for (const auto &it : mProjects) {
         if (it.second)
@@ -1245,11 +1295,11 @@ void Server::shutdown(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::sources(const QueryMessage &query, Connection *conn)
+void Server::sources(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Path path = query.query();
-    const bool flagsOnly = query.flags() & QueryMessage::CompilationFlagsOnly;
-    const bool splitLine = query.flags() & QueryMessage::CompilationFlagsSplitLine;
+    const Path path = query->query();
+    const bool flagsOnly = query->flags() & QueryMessage::CompilationFlagsOnly;
+    const bool splitLine = query->flags() & QueryMessage::CompilationFlagsSplitLine;
     if (path.isFile()) {
         std::shared_ptr<Project> project = projectForQuery(query);
         if (project) {
@@ -1279,7 +1329,7 @@ void Server::sources(const QueryMessage &query, Connection *conn)
     }
 
     if (std::shared_ptr<Project> project = currentProject()) {
-        const Match match = query.match();
+        const Match match = query->match();
         if (project->state() != Project::Loaded) {
             conn->write("Project loading");
         } else {
@@ -1303,7 +1353,7 @@ void Server::sources(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::dumpCompletions(const QueryMessage &query, Connection *conn)
+void Server::dumpCompletions(const std::shared_ptr<QueryMessage> &/*query*/, Connection *conn)
 {
     if (mCompletionThread) {
         conn->write(mCompletionThread->dump());
@@ -1313,9 +1363,29 @@ void Server::dumpCompletions(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::suspend(const QueryMessage &query, Connection *conn)
+void Server::dumpCompilationDatabase(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const Path p = query.match().pattern();
+    std::shared_ptr<Project> project = projectForQuery(query);
+    if (!project)
+        project = currentProject();
+    if (!project) {
+        conn->write("No current project");
+        conn->finish(1);
+        return;
+    }
+    if (project->state() != Project::Loaded) {
+        conn->write("Project loading");
+        conn->finish(1);
+        return;
+    }
+
+    conn->write(project->toCompilationDatabase());
+    conn->finish();
+}
+
+void Server::suspend(const std::shared_ptr<QueryMessage> &query, Connection *conn)
+{
+    const Path p = query->match().pattern();
     enum Mode {
         List,
         All,
@@ -1381,7 +1451,7 @@ void Server::suspend(const QueryMessage &query, Connection *conn)
     conn->finish();
 }
 
-void Server::syncProject(const QueryMessage &qyery, Connection *conn)
+void Server::syncProject(const std::shared_ptr<QueryMessage> &/*query*/, Connection *conn)
 {
     if (std::shared_ptr<Project> project = currentProject()) {
         if (!project->startSync(Project::Sync_Synchronous))
@@ -1393,17 +1463,17 @@ void Server::syncProject(const QueryMessage &qyery, Connection *conn)
     conn->finish();
 }
 
-void Server::handleVisitFileMessage(const VisitFileMessage &message, Connection *conn)
+void Server::handleVisitFileMessage(const std::shared_ptr<VisitFileMessage> &message, Connection *conn)
 {
     uint32_t fileId = 0;
     bool visit = false;
 
-    std::shared_ptr<Project> project = mProjects.value(message.project());
-    const uint64_t key = message.key();
-    if (project && project->isValidJob(key)) {
-        assert(message.file() == message.file().resolved());
-        fileId = Location::insertFile(message.file());
-        visit = project->visitFile(fileId, message.file(), key);
+    std::shared_ptr<Project> project = mProjects.value(message->project());
+    const uint64_t key = message->key();
+    if (project && project->isActiveJob(key)) {
+        assert(message->file() == message->file().resolved());
+        fileId = Location::insertFile(message->file());
+        visit = project->visitFile(fileId, message->file(), key);
     }
     VisitFileResponseMessage msg(fileId, visit);
     conn->send(msg);
@@ -1466,51 +1536,15 @@ static inline bool slowContains(const LinkedList<T> &list, const T &t)
     return false;
 }
 
-void Server::addJob(const std::shared_ptr<IndexerJob> &job)
-{
-    warning() << "adding job" << job->sourceFile;
-    assert(job);
-    assert(!(job->flags & IndexerJob::Complete));
-    mPendingJobs.push_back(job);
-    startJobs();
-}
-
-void Server::onJobFinished(Process *process, const std::shared_ptr<IndexerJob> &job)
-{
-    assert(process);
-    error() << process->readAllStdErr() << process->readAllStdOut();
-    if (job) {
-        assert(job->process == process);
-        assert(!(job->flags & IndexerJob::Complete));
-        job->flags &= ~IndexerJob::Running;
-        if (process->returnCode() != 0 && !(job->flags & IndexerJob::Aborted)) {
-            job->flags |= IndexerJob::Crashed;
-            std::shared_ptr<Project> proj = project(job->project);
-            if (proj) {
-                std::shared_ptr<IndexData> data(new IndexData(job->flags));
-                data->key = job->source.key();
-                data->dependencies[job->source.fileId].insert(job->source.fileId);
-
-                EventLoop::eventLoop()->registerTimer([data, job, proj](int) { proj->onJobFinished(data, job); },
-                                                      500, Timer::SingleShot);
-                // give it 500 ms before we try again
-            }
-        }
-        job->process = 0;
-    }
-    EventLoop::deleteLater(process);
-    startJobs();
-}
-
 void Server::stopServers()
 {
     Path::rm(mOptions.socketFile);
     mUnixServer.reset();
 }
 
-void Server::codeCompleteAt(const QueryMessage &query, Connection *conn)
+void Server::codeCompleteAt(const std::shared_ptr<QueryMessage> &query, Connection *conn)
 {
-    const String q = query.query();
+    const String q = query->query();
     Deserializer deserializer(q);
     Path path;
     int line, column;
@@ -1523,10 +1557,10 @@ void Server::codeCompleteAt(const QueryMessage &query, Connection *conn)
         return;
     }
     const uint32_t fileId = Location::insertFile(path);
-    Source source = project->sources(fileId).value(query.buildIndex());
+    Source source = project->sources(fileId).value(query->buildIndex());
     if (source.isNull()) {
         for (uint32_t dep : project->dependencies(fileId, Project::DependsOnArg)) {
-            source = project->sources(dep).value(query.buildIndex());
+            source = project->sources(dep).value(query->buildIndex());
             if (!source.isNull()) {
                 source.fileId = fileId;
                 break;
@@ -1546,52 +1580,221 @@ void Server::codeCompleteAt(const QueryMessage &query, Connection *conn)
 
     const Location loc(fileId, line, column);
     unsigned int flags = CompletionThread::None;
-    if (query.type() == QueryMessage::PrepareCodeCompleteAt)
+    if (query->type() == QueryMessage::PrepareCodeCompleteAt)
         flags |= CompletionThread::Refresh;
-    if (query.flags() & QueryMessage::ElispList)
+    if (query->flags() & QueryMessage::ElispList)
         flags |= CompletionThread::Elisp;
-    if (!(query.flags() & QueryMessage::SynchronousCompletions)) {
+    if (!(query->flags() & QueryMessage::SynchronousCompletions)) {
         conn->finish();
         conn = 0;
     }
     error() << "Got completion" << String::format("%s:%d:%d", path.constData(), line, column);
-    mCompletionThread->completeAt(source, loc, flags, query.unsavedFiles().value(path), conn);
+    mCompletionThread->completeAt(source, loc, flags, query->unsavedFiles().value(path), conn);
 }
 
 void Server::dumpJobs(Connection *conn)
 {
-    if (!mPendingJobs.isEmpty()) {
-        conn->write("Pending:");
-        for (const auto &job : mPendingJobs) {
-            conn->write<128>("%s: 0x%x %s",
-                             job->sourceFile.constData(),
-                             job->flags,
-                             IndexerJob::dumpFlags(job->flags).constData());
-        }
-    }
-    if (!mActiveJobs.isEmpty()) {
-        conn->write("Active:");
-        for (const auto &job : mActiveJobs) {
-            conn->write<128>("%s: 0x%x %s",
-                             job.second->sourceFile.constData(),
-                             job.second->flags,
-                             IndexerJob::dumpFlags(job.second->flags).constData());
-        }
-    }
+    mJobScheduler->dump(conn);
 }
 
-void Server::startJobs()
+class TestConnection : public Connection
 {
-    while (!mPendingJobs.isEmpty() && mActiveJobs.size() < mOptions.jobCount) {
-        std::shared_ptr<IndexerJob> job = mPendingJobs.front();
-        mPendingJobs.erase(mPendingJobs.begin());
-        if (mProjects.contains(job->project)) {
-            if (job->launchProcess()) {
-                mActiveJobs[job->process->pid()] = job;
-                job->process->finished().connect(std::bind(&Server::onProcessFinished, this, std::placeholders::_1));
+public:
+    TestConnection(const Path &workingDirectory)
+        : Connection(RClient::NumOptions), mIsFinished(false), mWorkingDirectory(workingDirectory)
+    {}
+    virtual bool send(const Message &message)
+    {
+        if (message.messageId() == Message::FinishMessageId) {
+            mIsFinished = true;
+            finished()(this, 0);
+        } else if (message.messageId() == Message::ResponseId) {
+            String response = reinterpret_cast<const ResponseMessage &>(message).data();
+            if (response.startsWith(mWorkingDirectory)) {
+                response.remove(0, mWorkingDirectory.size());
+            }
+            mOutput.append(response);
+        }
+        return true;
+    }
+    List<String> output() const { return mOutput; }
+    bool isFinished() const { return mIsFinished; }
+private:
+    bool mIsFinished;
+    List<String> mOutput;
+    const Path mWorkingDirectory;
+};
+
+bool Server::runTests()
+{
+    assert(!mOptions.tests.isEmpty());
+    bool ret = true;
+    int sourceCount = 0;
+    mIndexerMessageReceived.connect([&sourceCount]() {
+            // error() << "Got a finish" << sourceCount;
+            assert(sourceCount > 0);
+            if (!--sourceCount) {
+                EventLoop::eventLoop()->quit();
+            }
+        });
+    for (const auto &file : mOptions.tests) {
+        const String fileContents = file.readAll();
+        if (fileContents.isEmpty()) {
+            error() << "Failed to open file" << file;
+            ret = false;
+            continue;
+        }
+        bool ok = true;
+        const Value value = Value::fromJSON(fileContents, &ok);
+        warning() << "parsed json" << value.type() << fileContents.size();
+        if (!ok || !value.isMap()) {
+            error() << "Failed to parse json" << file << ok << value.type() << value;
+            ret = false;
+            continue;
+        }
+        const List<Value> tests = value.operator[]<List<Value> >("tests");
+        if (tests.isEmpty()) {
+            error() << "Invalid test" << file;
+            ret = false;
+            continue;
+        }
+        const List<Value> sources = value.operator[]<List<Value> >("sources");
+        if (sources.isEmpty()) {
+            error() << "Invalid test" << file;
+            ret = false;
+            continue;
+        }
+        warning() << sources.size() << "sources and" << tests.size() << "tests";
+        const Path workingDirectory = file.parentDir();
+        const Path projectRoot = RTags::findProjectRoot(workingDirectory, RTags::SourceRoot);
+        if (projectRoot.isEmpty()) {
+            error() << "Can't find project root" << workingDirectory;
+            ret = false;
+            continue;
+        }
+        for (const auto &source : sources) {
+            if (!source.isString()) {
+                error() << "Invalid source" << source;
+                ret = false;
+                continue;
+            }
+            if (!index("clang " + source.convert<String>(), workingDirectory, workingDirectory)) {
+                error() << "Failed to index" << ("clang " + source.convert<String>()) << workingDirectory;
+                ret = false;
+                continue;
+            }
+            ++sourceCount;
+        }
+        mOptions.syncThreshold = sourceCount;
+        EventLoop::eventLoop()->exec(mOptions.testTimeout);
+        if (sourceCount) {
+            error() << "Timed out waiting for sources to compile";
+            sourceCount = 0;
+            ret = false;
+            continue;
+        }
+
+        int passes = 0;
+        int failures = 0;
+        int idx = -1;
+        for (const auto &test : tests) {
+            ++idx;
+            if (!test.isMap()) {
+                error() << "Invalid test" << test.type();
+                ret = false;
+                continue;
+            }
+            const String type = test.operator[]<String>("type");
+            if (type.isEmpty()) {
+                error() << "Invalid test. No type";
+                ret = false;
+                continue;
+            }
+            std::shared_ptr<QueryMessage> query;
+            if (type == "follow-location") {
+                const String location = Location::encode(test.operator[]<String>("location"), workingDirectory);
+                if (location.isEmpty()) {
+                    error() << "Invalid test. Invalid location";
+                    ret = false;
+                    continue;
+                }
+                query.reset(new QueryMessage(QueryMessage::FollowLocation));
+                query->setQuery(location);
+            } else if (type == "references") {
+                const String location = Location::encode(test.operator[]<String>("location"), workingDirectory);
+                if (location.isEmpty()) {
+                    error() << "Invalid test. Invalid location";
+                    ret = false;
+                    continue;
+                }
+                query.reset(new QueryMessage(QueryMessage::ReferencesLocation));
+                query->setQuery(location);
+            } else if (type == "references-name") {
+                const String name = test.operator[]<String>("name");
+                if (name.isEmpty()) {
+                    error() << "Invalid test. Invalid name";
+                    ret = false;
+                    continue;
+                }
+                query.reset(new QueryMessage(QueryMessage::ReferencesLocation));
+                query->setQuery(name);
             } else {
-                onJobFinished(job->process, job);
+                error() << "Unknown test" << type;
+                ret = false;
+                continue;
+            }
+            const List<Value> flags = test.operator[]<List<Value> >("flags");
+            for (const auto &flag : flags) {
+                if (!flag.isString()) {
+                    error() << "Invalid flag";
+                    ret = false;
+                } else {
+                    const QueryMessage::Flag f = QueryMessage::flagFromString(flag.convert<String>());
+                    if (f == QueryMessage::NoFlag) {
+                        error() << "Invalid flag";
+                        ret = false;
+                        continue;
+                    }
+                    query->setFlag(f);
+                }
+            }
+            TestConnection conn(workingDirectory);
+            query->setFlag(QueryMessage::SilentQuery);
+            handleQueryMessage(query, &conn);
+            if (!conn.isFinished()) {
+                error() << "Query failed";
+                ret = false;
+                continue;
+            }
+
+            const Value out = test["output"];
+            if (!out.isList()) {
+                error() << "Invalid output";
+                ret = false;
+                continue;
+            }
+            List<String> output;
+            for (auto it=out.listBegin(); it != out.listEnd(); ++it) {
+                if (!it->isString()) {
+                    error() << "Invalid output";
+                    ret = false;
+                    continue;
+                }
+                output.append(it->convert<String>());
+            }
+            if (output != conn.output()) {
+                error() << "Test" << idx << "failed. Expected:";
+                error() << output;
+                error() << "Got:";
+                error() << conn.output();
+                ret = false;
+                ++failures;
+            } else {
+                warning() << "Test passed";
+                ++passes;
             }
         }
+        error() << passes << "passes" << failures << "failures" << (tests.size() - failures - passes) << "invalid";
     }
+    return ret;
 }

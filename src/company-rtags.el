@@ -77,14 +77,16 @@ and `c-electric-colon', for automatic completion right after \">\" and
   (let ((meta (company-rtags--meta candidate)))
     (cond
      ((null meta) nil)
-     ((string-match "\\((.*)\\'\\)" meta)
+     ((string-match "\\((.*)\\)" meta)
       (match-string 1 meta)))))
 
 (defun company-rtags (command &optional arg &rest ignored)
   "`company-mode' completion back-end for `rtags'."
   (interactive (list 'interactive))
   (case command
-    (prefix (and (memq major-mode company-rtags-modes)
+    (interactive (company-begin-backend 'company-rtags))
+    (prefix (and (rtags-is-indexed)
+                 (memq major-mode company-rtags-modes)
                  buffer-file-name
                  (not (company-in-string-or-comment))
                  (company-rtags--prefix)))

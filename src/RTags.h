@@ -32,7 +32,8 @@ class Database;
 class Project;
 namespace RTags {
 
-enum { DatabaseVersion = 49 };
+enum { DatabaseVersion = 53 };
+enum { ASTManifestVersion = 1 };
 
 enum {
     CompilationError = -1,
@@ -54,6 +55,8 @@ void initMessages();
 }
 
 class CursorInfo;
+struct Diagnostic;
+typedef Map<Location, Diagnostic> DiagnosticsMap;
 typedef Map<Location, std::shared_ptr<CursorInfo> > SymbolMap;
 typedef Hash<uint32_t, SymbolMap> ErrorSymbolMap;
 typedef Hash<String, Set<Location> > UsrMap;
@@ -63,15 +66,12 @@ typedef Hash<uint32_t, Set<uint32_t> > DependencyMap;
 typedef Map<uint64_t, Source> SourceMap;
 typedef Map<Path, Set<String> > FilesMap;
 typedef Hash<uint32_t, Set<FixIt> > FixItMap;
-typedef Hash<uint32_t, List<String> > DiagnosticsMap;
 typedef Hash<Path, String> UnsavedFiles;
 
 namespace RTags {
 void dirtySymbolNames(SymbolNameMap &map, const Set<uint32_t> &dirty);
 void dirtySymbols(SymbolMap &map, const Set<uint32_t> &dirty);
 void dirtyUsr(UsrMap &map, const Set<uint32_t> &dirty);
-
-List<String> backtrace(int maxFrames = -1);
 
 template <typename Container, typename Value>
 inline bool addTo(Container &container, const Value &value)

@@ -31,7 +31,7 @@ class Location;
 class QueryMessage;
 class Project;
 class Connection;
-class Job
+class QueryJob
 {
 public:
     enum Flag {
@@ -41,9 +41,9 @@ public:
         QuietJob = 0x4
     };
     enum { Priority = 10 };
-    Job(const QueryMessage &msg, unsigned jobFlags, const std::shared_ptr<Project> &proj);
-    Job(unsigned jobFlags, const std::shared_ptr<Project> &project);
-    ~Job();
+    QueryJob(const std::shared_ptr<QueryMessage> &msg, unsigned jobFlags, const std::shared_ptr<Project> &proj);
+    QueryJob(unsigned jobFlags, const std::shared_ptr<Project> &project);
+    ~QueryJob();
 
     bool hasFilter() const { return mPathFilters || mPathFiltersRegExp; }
     List<String> pathFilters() const { return mPathFilters ? *mPathFilters : List<String>(); }
@@ -63,9 +63,8 @@ public:
     unsigned jobFlags() const { return mJobFlags; }
     void setJobFlags(unsigned flags) { mJobFlags = flags; }
     void setJobFlag(Flag flag, bool on = true) { if (on) { mJobFlags |= flag; } else { mJobFlags &= ~flag; } }
-    unsigned queryFlags() const { return mQueryFlags; }
-    void setQueryFlags(unsigned queryFlags) { mQueryFlags = queryFlags; }
-    unsigned keyFlags() const;
+    unsigned queryFlags() const { return mQueryMessage ? mQueryMessage->flags() : 0; }
+    unsigned keyFlags() const { return QueryMessage::keyFlags(queryFlags()); }
     bool filter(const String &val) const;
     Signal<std::function<void(const String &)> > &output() { return mOutput; }
     std::shared_ptr<Project> project() const { return mProject.lock(); }
@@ -79,21 +78,20 @@ public:
 private:
     mutable std::mutex mMutex;
     bool mAborted;
+    int mLinesWritten;
     bool writeRaw(const String &out, unsigned flags);
-    int mMinLine, mMaxLine;
+    std::shared_ptr<QueryMessage> mQueryMessage;
     unsigned mJobFlags;
-    unsigned mQueryFlags;
     Signal<std::function<void(const String &)> > mOutput;
     std::weak_ptr<Project> mProject;
     List<String> *mPathFilters;
     List<RegExp> *mPathFiltersRegExp;
-    int mMax;
     String mBuffer;
     Connection *mConnection;
 };
 
 template <int StaticBufSize>
-inline bool Job::write(unsigned flags, const char *format, ...)
+inline bool QueryJob::write(unsigned flags, const char *format, ...)
 {
     va_list args;
     va_start(args, format);
@@ -103,7 +101,7 @@ inline bool Job::write(unsigned flags, const char *format, ...)
 }
 
 template <int StaticBufSize>
-inline bool Job::write(const char *format, ...)
+inline bool QueryJob::write(const char *format, ...)
 {
     va_list args;
     va_start(args, format);

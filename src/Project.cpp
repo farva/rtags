@@ -15,17 +15,20 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 
 #include "Project.h"
 #include "FileManager.h"
+#include "Diagnostic.h"
 #include "DataFile.h"
 #include "IndexerJob.h"
 #include "RTags.h"
 #include "Server.h"
 #include "Server.h"
+#include "JobScheduler.h"
 #include "IndexData.h"
 #include <math.h>
 #include <fnmatch.h>
 #include <rct/Log.h>
 #include <rct/MemoryMonitor.h>
 #include <rct/Path.h>
+#include <rct/Value.h>
 #include <rct/Rct.h>
 #include <rct/ReadLocker.h>
 #include <rct/RegExp.h>
@@ -41,7 +44,7 @@ class RestoreThread : public Thread
 {
 public:
     RestoreThread(const std::shared_ptr<Project> &project)
-        : mFinished(false), mPath(project->path()), mWeak(project)
+        : mPath(project->path()), mWeak(project)
     {
         setAutoDelete(true);
     }
@@ -50,20 +53,27 @@ public:
     {
         StopWatch timer;
         RestoreThread *thread = restore() ? this : 0;
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool finished = false;
 
-        EventLoop::mainEventLoop()->callLater([thread, &timer, this]() {
+        EventLoop::mainEventLoop()->callLater([this, thread, &timer, &mutex, &condition, &finished]() {
                 if (std::shared_ptr<Project> proj = mWeak.lock()) {
                     proj->updateContents(thread);
                     if (thread)
                         error() << "Restored project" << mPath << "in" << timer.elapsed() << "ms";
                 }
-                this->finish();
+                std::unique_lock<std::mutex> lock(mutex);
+                finished = true;
+                condition.notify_one();
             });
-        std::unique_lock<std::mutex> lock(mMutex);
-        while (!mFinished) {
-            mCondition.wait(lock);
+
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!finished) {
+            condition.wait(lock);
         }
     }
+
     bool restore()
     {
         Path path = mPath;
@@ -88,16 +98,6 @@ public:
         return true;
     }
 
-    void finish()
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mFinished = true;
-        mCondition.notify_one();
-    }
-
-    std::mutex mMutex;
-    std::condition_variable mCondition;
-    bool mFinished;
     const Path mPath;
     SymbolMap mSymbols;
     SymbolNameMap mSymbolNames;
@@ -296,10 +296,7 @@ Project::Project(const Path &path)
 Project::~Project()
 {
     assert(EventLoop::isMainThread());
-    for (auto it = mJobs.constBegin(); it != mJobs.constEnd(); ++it) {
-        if (it->second.job)
-            it->second.job->abort();
-    }
+    assert(mActiveJobs.isEmpty());
 }
 
 void Project::init()
@@ -321,7 +318,7 @@ void Project::updateContents(RestoreThread *thread)
     if (thread) {
         mSymbols = std::move(thread->mSymbols);
         mSymbolNames = std::move(thread->mSymbolNames);
-        mUsr = std::move(thread->mUsr);;
+        mUsr = std::move(thread->mUsr);
         mDependencies = std::move(thread->mDependencies);
         mSources = std::move(thread->mSources);
 
@@ -376,17 +373,14 @@ void Project::updateContents(RestoreThread *thread)
             }
         }
     }
-    Hash<uint64_t, JobData> pendingJobs = std::move(mJobs);
+    List<std::shared_ptr<IndexerJob> > pendingJobs = std::move(mPendingJobs);
     mState = Loaded;
     if ((!dirty || !startDirtyJobs(dirty.get())) && needsSave)
         save();
 
-    for (const auto &it : pendingJobs) {
-        assert(it.second.pendingJob);
-        if (!hasSource(it.second.pendingJob->source)) {
-            const auto job = std::move(it.second.pendingJob);
-            index(job);
-        }
+    for (const auto &job : pendingJobs) {
+        assert(job);
+        index(job);
     }
 }
 
@@ -426,16 +420,17 @@ void Project::unload()
     default:
         break;
     }
-    for (auto it = mJobs.constBegin(); it != mJobs.constEnd(); ++it) {
-        if (it->second.job)
-            it->second.job->abort();
+    save(); // we always save since sources very likely had their Enabledness changed
+    for (const auto &job : mActiveJobs) {
+        assert(job.second);
+        Server::instance()->jobScheduler()->abort(job.second);
     }
 
     const String msg = sync();
     if (!msg.isEmpty())
         error() << msg;
 
-    mJobs.clear();
+    mActiveJobs.clear();
     fileManager.reset();
 
     mSymbols.clear();
@@ -456,7 +451,7 @@ bool Project::match(const Match &p, bool *indexed) const
     paths[1].resolve();
     const int count = paths[1].compare(paths[0]) ? 2 : 1;
     bool ret = false;
-    const Path resolvedPath = mPath.resolved();;
+    const Path resolvedPath = mPath.resolved();
     for (int i=0; i<count; ++i) {
         const Path &path = paths[i];
         const uint32_t id = Location::fileId(path);
@@ -475,108 +470,71 @@ bool Project::match(const Match &p, bool *indexed) const
     return ret;
 }
 
-void Project::onJobFinished(const std::shared_ptr<IndexData> &indexData, const std::shared_ptr<IndexerJob> &job)
+void Project::onJobFinished(const std::shared_ptr<IndexerJob> &job, const std::shared_ptr<IndexData> &indexData)
 {
     mSyncTimer.stop();
     if (mState == Syncing) {
-        mPendingIndexData[indexData->key] = std::make_pair(indexData, job);
+        mPendingIndexData[indexData->key] = std::make_pair(job, indexData);
         return;
     } else if (mState != Loaded) {
         return;
     }
     assert(indexData);
-    std::shared_ptr<IndexerJob> pendingJob;
+    std::shared_ptr<IndexerJob> restart;
     const uint32_t fileId = indexData->fileId();
-    const auto it = mJobs.find(indexData->key);
-    if (it == mJobs.end()) {
+    auto j = mActiveJobs.take(indexData->key);
+    if (!j) {
         error() << "Couldn't find JobData for" << Location::path(fileId);
         return;
-    }
-
-    JobData &jobData = it->second;
-    if (jobData.job != job)
+    } else if (j != job) {
+        error() << "Wrong IndexerJob for for" << Location::path(fileId);
         return;
-    assert(jobData.job);
-    const bool success = jobData.job->flags & IndexerJob::Complete;
-    if (!success) {
-        // error() << "No success for" << Location::path(fileId);
-        std::lock_guard<std::mutex> lock(mMutex);
-        for (const auto &f : jobData.job->visited) {
-            // error() << "Returning files" << Location::path(f);
-            mVisitedFiles.remove(f);
-        }
-    }
-    // assert(!success || !(jobData->job->flags & (IndexerJob::Crashed|IndexerJob::Aborted)));
-    if (jobData.job->flags & IndexerJob::Crashed) {
-        ++jobData.crashCount;
-    } else {
-        jobData.crashCount = 0;
     }
 
-    bool crashed = false;
+    const bool success = job->flags & IndexerJob::Complete;
+    assert(!(job->flags & IndexerJob::Aborted));
+    assert(((job->flags & (IndexerJob::Complete|IndexerJob::Crashed)) == IndexerJob::Complete)
+           || ((job->flags & (IndexerJob::Complete|IndexerJob::Crashed)) == IndexerJob::Crashed));
     const auto &options = Server::instance()->options();
-    if (jobData.crashCount < options.maxCrashCount) {
-        if (jobData.pendingJob) {
-            std::swap(pendingJob, jobData.pendingJob);
-        } else if (!success) {
-            // relaunch the same job
-            if (jobData.job->flags & IndexerJob::Crashed) {
-                crashed = true;
-                error("%s crashed, restarting", jobData.job->source.sourceFile().constData());
-            }
-            pendingJob = jobData.job;
-            pendingJob->flags &= ~IndexerJob::Type_Mask;
-            pendingJob->visited.clear();
-        }
+    if (!success) {
+        releaseFileIds(job->visited);
     }
-    if (!pendingJob) {
-        const int idx = mJobCounter - mJobs.size() + 1;
-        if (testLog(RTags::CompilationErrorXml)) {
-            logDirect(RTags::CompilationErrorXml, indexData->xmlDiagnostics);
+
+    auto src = mSources.find(indexData->key);
+    if (src == mSources.end()) {
+        error() << "Can't find source for" << Location::path(fileId);
+        return;
+    }
+
+    const int idx = mJobCounter - mActiveJobs.size();
+    if (testLog(RTags::CompilationErrorXml)) {
+        logDirect(RTags::CompilationErrorXml, Diagnostic::format(indexData->diagnostics));
+        if (!(options.options & Server::NoProgress)) {
             log(RTags::CompilationErrorXml,
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<progress index=\"%d\" total=\"%d\"></progress>",
                 idx, mJobCounter);
         }
-        if (success) {
-            auto src = mSources.find(indexData->key);
-            if (src != mSources.end()) {
-                mIndexData[indexData->key] = indexData;
-                src->second.parsed = indexData->parseTime;
-                error("[%3d%%] %d/%d %s %s.",
-                      static_cast<int>(round((double(idx) / double(mJobCounter)) * 100.0)), idx, mJobCounter,
-                      String::formatTime(time(0), String::Time).constData(),
-                      indexData->message.constData());
-            }
-        } else {
-            assert(indexData->flags & IndexerJob::Crashed);
-            mIndexData[indexData->key] = indexData;
-            error("[%3d%%] %d/%d %s %s indexing crashed.",
-                  static_cast<int>(round((double(idx) / double(mJobCounter)) * 100.0)), idx, mJobCounter,
-                  String::formatTime(time(0), String::Time).constData(),
-                  Location::path(fileId).toTilde().constData());
-        }
-        mJobs.erase(it);
+    }
 
-        if (mJobs.isEmpty()) {
-            mSyncTimer.restart(indexData->flags & IndexerJob::Dirty ? 0 : SyncTimeout, Timer::SingleShot);
-        } else if (options.syncThreshold && mIndexData.size() >= options.syncThreshold) {
-            startSync(Sync_Asynchronous);
-        }
+    mIndexData[indexData->key] = indexData;
+    if (success) {
+        src->second.parsed = indexData->parseTime;
+        error("[%3d%%] %d/%d %s %s.",
+              static_cast<int>(round((double(idx) / double(mJobCounter)) * 100.0)), idx, mJobCounter,
+              String::formatTime(time(0), String::Time).constData(),
+              indexData->message.constData());
     } else {
-        jobData.job.reset();
-        enum { CrashRetryTimeout = 1500 }; // ### should be configurable
-        if (crashed) {
-            jobData.stopTimer();
-            std::weak_ptr<Project> project = shared_from_this();
-            const int id = EventLoop::mainEventLoop()->registerTimer([project, pendingJob](int) {
-                    if (std::shared_ptr<Project> p = project.lock())
-                        p->index(pendingJob);
-                }, CrashRetryTimeout, Timer::SingleShot);
-            jobData.pendingRestartTimerId = id;
-        } else {
-            index(pendingJob);
-        }
-        --mJobCounter;
+        assert(indexData->flags & IndexerJob::Crashed);
+        error("[%3d%%] %d/%d %s %s indexing crashed.",
+              static_cast<int>(round((double(idx) / double(mJobCounter)) * 100.0)), idx, mJobCounter,
+              String::formatTime(time(0), String::Time).constData(),
+              Location::path(fileId).toTilde().constData());
+    }
+
+    if (options.syncThreshold && mIndexData.size() >= options.syncThreshold) {
+        startSync(Sync_Asynchronous);
+    } else if (mActiveJobs.isEmpty()) {
+        mSyncTimer.restart(indexData->flags & IndexerJob::Dirty ? 0 : SyncTimeout, Timer::SingleShot);
     }
 }
 
@@ -606,42 +564,117 @@ bool Project::save()
     return true;
 }
 
+static inline void markActive(SourceMap::iterator start, uint32_t buildId, const SourceMap::iterator end)
+{
+    const uint32_t fileId = start->second.fileId;
+    while (start != end) {
+        uint32_t f, b;
+        Source::decodeKey(start->first, f, b);
+        if (f != fileId)
+            break;
+
+        if (b == buildId) {
+            start->second.flags |= Source::Active;
+        } else {
+            start->second.flags &= ~Source::Active;
+        }
+        ++start;
+    }
+}
+
+
 void Project::index(const std::shared_ptr<IndexerJob> &job)
 {
     const Path sourceFile = job->sourceFile;
     static const char *fileFilter = getenv("RTAGS_FILE_FILTER");
-    if (fileFilter && !strstr(job->sourceFile.constData(), fileFilter))
-        return;
-
-    const uint64_t key = job->source.key();
-    JobData &data = mJobs[key];
-    data.stopTimer();
-
-    if (mState != Loaded) {
-        // error() << "Index called at" << static_cast<int>(mState) << "time. Setting pending" << sourceFile;
-        data.pendingJob = job;
+    if (fileFilter && !strstr(job->sourceFile.constData(), fileFilter)) {
+        error() << "Not indexing" << job->sourceFile.constData() << "because of file filter"
+                << fileFilter;
         return;
     }
 
-    if (data.job && data.job->update(job))
+    if (mState != Loaded) {
+        mPendingJobs.append(job);
         return;
-
-    const bool existed = mSources.contains(key);
-    mSources[key] = job->source;
-    watch(sourceFile);
-
-    assert(!data.pendingJob);
-    mIndexData.remove(key);
-
-    if (Server::instance()->suspended() && existed && (job->flags & IndexerJob::Compile))
+    }
+    const uint64_t key = job->source.key();
+    if (Server::instance()->suspended() && mSources.contains(key) && (job->flags & IndexerJob::Compile)) {
         return;
+    }
 
-    if (!data.job && !mJobCounter++)
+    if (job->flags & IndexerJob::Compile) {
+        const auto &options = Server::instance()->options();
+        if (options.options & Server::NoFileSystemWatch) {
+            auto it = mSources.lower_bound(Source::key(job->source.fileId, 0));
+            if (it != mSources.end()) {
+                uint32_t f, b;
+                Source::decodeKey(it->first, f, b);
+                if (f == job->source.fileId) {
+                    // When we're not watching the file system, we ignore
+                    // updating compiles. This means that you always have to
+                    // do check-reindex to build existing files!
+                    return;
+                }
+            }
+        } else {
+            auto cur = mSources.find(key);
+            if (cur != mSources.end()) {
+                if (!(cur->second.flags & Source::Active))
+                    markActive(mSources.lower_bound(Source::key(job->source.fileId, 0)), cur->second.buildRootId, mSources.end());
+                if (cur->second.compareArguments(job->source)) {
+                    // no updates
+                    return;
+                }
+            } else {
+                auto it = mSources.lower_bound(Source::key(job->source.fileId, 0));
+                const auto start = it;
+                const bool disallowMultiple = options.options & Server::DisallowMultipleSources;
+                bool unsetActive = false;
+                while (it != mSources.end()) {
+                    uint32_t f, b;
+                    Source::decodeKey(it->first, f, b);
+                    if (f != job->source.fileId)
+                        break;
+
+                    if (it->second.compareArguments(job->source)) {
+                        markActive(start, b, mSources.end());
+                        // no updates
+                        return;
+                    } else if (disallowMultiple) {
+                        mSources.erase(it++);
+                        continue;
+                    }
+                    unsetActive = true;
+                    ++it;
+                }
+                if (unsetActive) {
+                    assert(!disallowMultiple);
+                    markActive(start, 0, mSources.end());
+                }
+            }
+        }
+    }
+
+    Source &src = mSources[key];
+    src = job->source;
+    src.flags |= Source::Active;
+
+    std::shared_ptr<IndexerJob> &ref = mActiveJobs[key];
+    if (ref) {
+        releaseFileIds(ref->visited);
+        Server::instance()->jobScheduler()->abort(ref);
+        --mJobCounter;
+    }
+    ref = job;
+
+    if (mIndexData.remove(key))
+        --mJobCounter;
+
+    if (!mJobCounter++)
         mTimer.start();
 
-    data.job = job;
     mSyncTimer.stop();
-    Server::instance()->addJob(job);
+    Server::instance()->jobScheduler()->add(job);
 }
 
 void Project::onFileModifiedOrRemoved(const Path &file)
@@ -718,9 +751,9 @@ Set<uint32_t> Project::dependencies(uint32_t fileId, DependencyMode mode) const
     return ret;
 }
 
-int Project::reindex(const Match &match, const QueryMessage &query)
+int Project::reindex(const Match &match, const std::shared_ptr<QueryMessage> &query)
 {
-    if (query.type() == QueryMessage::Reindex) {
+    if (query->type() == QueryMessage::Reindex) {
         Set<uint32_t> dirtyFiles;
 
         const auto end = mDependencies.constEnd();
@@ -733,11 +766,11 @@ int Project::reindex(const Match &match, const QueryMessage &query)
             return 0;
         SimpleDirty dirty;
         dirty.init(dirtyFiles, mDependencies);
-        return startDirtyJobs(&dirty, query.unsavedFiles());
+        return startDirtyJobs(&dirty, query->unsavedFiles());
     } else {
-        assert(query.type() == QueryMessage::CheckReindex);
+        assert(query->type() == QueryMessage::CheckReindex);
         IfModifiedDirty dirty(mDependencies, match);
-        return startDirtyJobs(&dirty, query.unsavedFiles());
+        return startDirtyJobs(&dirty, query->unsavedFiles());
     }
 }
 
@@ -750,9 +783,11 @@ int Project::remove(const Match &match)
         if (match.match(it->second.sourceFile())) {
             const uint32_t fileId = it->second.fileId;
             mSources.erase(it++);
-            JobData data = mJobs.take(fileId);
-            if (data.job)
-                data.job->abort();
+            std::shared_ptr<IndexerJob> job = mActiveJobs.take(fileId);
+            if (job) {
+                releaseFileIds(job->visited);
+                Server::instance()->jobScheduler()->abort(job);
+            }
             mIndexData.remove(fileId);
             dirty.insert(fileId);
             ++count;
@@ -772,7 +807,7 @@ int Project::startDirtyJobs(Dirty *dirty, const UnsavedFiles &unsavedFiles)
 {
     List<Source> toIndex;
     for (const auto &source : mSources) {
-        if (dirty->isDirty(source.second)) {
+        if (source.second.flags & Source::Active && dirty->isDirty(source.second)) {
             toIndex << source.second;
         }
     }
@@ -982,6 +1017,8 @@ String Project::fixIts(uint32_t fileId) const
 
 bool Project::startSync(SyncMode mode)
 {
+    if (!Server::instance()->options().tests.isEmpty())
+        mode = Sync_Synchronous;
     if (mState != Loaded) {
         if (mode == Sync_Asynchronous)
             mSyncTimer.restart(SyncTimeout, Timer::SingleShot);
@@ -1130,54 +1167,6 @@ void Project::watch(const Path &file)
     }
 }
 
-bool Project::hasSource(const Source &source) const
-{
-    const uint64_t key = source.key();
-    auto it = mSources.lower_bound(Source::key(source.fileId, 0));
-    const auto &options = Server::instance()->options();
-    const bool disallowMultiple = options.options & Server::DisallowMultipleSources;
-    const bool ignoreExistingFiles = options.options & Server::NoFileSystemWatch;
-    bool found = false;
-    while (it != mSources.end()) {
-        uint32_t f, b;
-        Source::decodeKey(it->first, f, b);
-        if (f != source.fileId) {
-            break;
-        }
-        found = true;
-        if (ignoreExistingFiles) {
-            // When we're not watching the file system, we ignore
-            // updating compiles. This means that you always have to
-            // do check-reindex to build existing files!
-            return true;
-        }
-        if (it->first == key) {
-            return it->second.compareArguments(source);
-            // if the build key is the same we want to return false if the arguments have updated
-        }
-        if (disallowMultiple || it->second.compareArguments(source)) {// similar enough that we don't want two builds
-            return true;
-        }
-        ++it;
-    }
-    if (found) {
-        const Map<String, String> config = RTags::rtagsConfig(source.sourceFile());
-        if (config.contains("multi-build")) {
-            const List<String> multi = config.value("multi-build").split(';');
-            const Path sourceFile = source.sourceFile();
-            for (const auto &filter : multi) {
-                if (!fnmatch(filter.constData(), sourceFile.constData(), 0)) {
-                    // we allow multi builds for this file
-                    return false;
-                }
-            }
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void Project::onSynced()
 {
     assert(mState == Syncing);
@@ -1186,17 +1175,15 @@ void Project::onSynced()
         onJobFinished(it.second.first, it.second.second);
     }
     mPendingIndexData.clear();
-    for (auto &jobData : mJobs) {
-        if (jobData.second.pendingJob) {
-            const auto job = std::move(jobData.second.pendingJob);
-            index(job);
-        }
+    for (const auto &job : mPendingJobs) {
+        index(job);
     }
+    mPendingJobs.clear();
 }
 
 String Project::sync()
 {
-    mJobCounter = mJobs.size();
+    mJobCounter = mActiveJobs.size();
     StopWatch sw;
     if (mDirtyFiles.isEmpty() && mIndexData.isEmpty()) {
         return String();
@@ -1245,4 +1232,21 @@ String Project::sync()
     mIndexData.clear();
     mTimer.start();
     return msg;
+}
+
+String Project::toCompilationDatabase() const
+{
+    const unsigned int flags = (Source::IncludeCompiler | Source::IncludeSourceFile | Source::IncludeDefines
+                                | Source::IncludeIncludepaths | Source::QuoteDefines | Source::FilterBlacklist);
+    Value ret(List<Value>(mSources.size()));
+    int i = 0;
+    for (const auto &source : mSources) {
+        Value unit;
+        unit["directory"] = source.second.directory;
+        unit["file"] = source.second.sourceFile();
+        unit["command"] = source.second.toCommandLine(flags);
+        ret[i++] = unit;
+    }
+
+    return ret.toJSON(true);
 }

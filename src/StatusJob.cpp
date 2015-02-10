@@ -22,8 +22,8 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include "CompilerManager.h"
 
 const char *StatusJob::delimiter = "*********************************";
-StatusJob::StatusJob(const QueryMessage &q, const std::shared_ptr<Project> &project)
-    : Job(q, WriteUnfiltered|QuietJob, project), query(q.query())
+StatusJob::StatusJob(const std::shared_ptr<QueryMessage> &q, const std::shared_ptr<Project> &project)
+    : QueryJob(q, WriteUnfiltered|QuietJob, project), query(q->query())
 {
 }
 
@@ -164,16 +164,18 @@ int StatusJob::execute()
         matched = true;
         if (!write(delimiter) || !write("compilers") || !write(delimiter))
             return 1;
+        Source source;
         for (const Path &compiler : CompilerManager::compilers()) {
-            Set<Source::Define> defines;
-            List<Source::Include> includePaths;
-            CompilerManager::data(compiler, &defines, &includePaths);
+            source.compilerId = Location::insertFile(compiler);
+            source.defines.clear();
+            source.includePaths.clear();
+            CompilerManager::applyToSource(source, true, true);
             write(compiler);
             write("  Defines:");
-            for (const auto &it : defines)
+            for (const auto &it : source.defines)
                 write<512>("    %s", it.toString().constData());
             write("  Includepaths:");
-            for (const auto &it : includePaths)
+            for (const auto &it : source.includePaths)
                 write<512>("    %s", it.toString().constData());
             write("");
         }

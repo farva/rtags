@@ -38,6 +38,8 @@ String Source::toString() const
         ret << " Build: " << buildRoot();
     if (parsed)
         ret << " Parsed: " << String::formatTime(parsed / 1000, String::DateTime);
+    if (flags & Active)
+        ret << " Active";
     return ret;
 }
 
@@ -206,7 +208,7 @@ static inline void addIncludeArg(List<Source::Include> &includePaths,
     const String &arg = args.at(idx);
     Path path;
     if (arg.size() == argLen) {
-        path = Path::resolved(args.at(++idx), Path::MakeAbsolute, cwd);
+        path = Path::resolved(args.value(++idx), Path::MakeAbsolute, cwd);
         if (type == Source::Include::Type_None) {
             arguments.append(arg);
             arguments.append(path);
@@ -237,8 +239,10 @@ static const char* valueArgs[] = {
     "-isysroot",
     "-Xpreprocessor",
     "-Xassembler",
-    "-T",
     "-Xlinker",
+    "-Xclang",
+    "-Xanalyzer",
+    "-T",
     "-V",
     "-b",
     "-G",
@@ -246,10 +250,11 @@ static const char* valueArgs[] = {
     "-MF",
     "-MT",
     "-MQ",
+    "-gcc-toolchain",
     0
 };
 
-static const char* blacklist[] = {
+static const char *blacklist[] = {
     "-M",
     "-MM",
     "-MG",
@@ -259,15 +264,26 @@ static const char* blacklist[] = {
     "-MF",
     "-MT",
     "-MQ",
+    "-gcc-toolchain",
     0
 };
 
-static inline bool hasValue(const String& arg)
+static inline bool hasValue(const String &arg)
 {
     for (int i = 0; valueArgs[i]; ++i) {
         if (arg == valueArgs[i])
             return true;
     }
+
+    if (Server *server = Server::instance()) {
+        const Set<String> &blockedArguments = server->options().blockedArguments;
+        for (const String &blockedArg : blockedArguments) {
+            if (blockedArg.endsWith('=') && blockedArg.startsWith(arg)) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -431,8 +447,25 @@ List<Source> Source::parse(const String &cmdLine, const Path &base, unsigned int
             } else if (arg.startsWith("-I")) {
                 addIncludeArg(includePaths, arguments, Source::Include::Type_Include, 2, split, i, path);
 #ifdef OS_Darwin
-            } else if (arg.startsWith("-F")) { // Framework include
+            } else if (arg == "-arch") {
+                // Limit -arch to a single format i368/x86_64. Darwin allows
+                // mutliple -arch options to build a combined binary.  However,
+                // libclang (the indexer) will fail if it gets more than one; it
+                // only allows one 'job', in clang parlance, per invocation. It
+                // quietly returns a null CXTranslationUnit and is very
+                // difficult to see why indexing failed (ie. debug)
+                if (!arguments.contains(arg)) {
+                    arguments.append(arg);
+                    arguments.append(split.value(++i));
+                } else {
+                    warning() << "[Source::parse] Removing additional -arch argument(s) to allow indexing.";
+                }
+
+            // Framework includes
+            } else if (arg.startsWith("-F")) {
                 addIncludeArg(includePaths, arguments, Source::Include::Type_Framework, 2, split, i, path);
+            } else if (arg.startsWith("-iframework")) {
+                addIncludeArg(includePaths, arguments, Source::Include::Type_SystemFramework, 11, split, i, path);
 #endif
             } else if (arg.startsWith("-include")) {
                 addIncludeArg(includePaths, arguments, Source::Include::Type_None, 8, split, i, path);
@@ -589,6 +622,7 @@ List<Source> Source::parse(const String &cmdLine, const Path &base, unsigned int
         int idx = 0;
         for (const auto input : inputs) {
             Source &source = ret[idx++];
+            source.directory = path;
             source.fileId = input.first;
             source.compilerId = compilerId;
             source.buildRootId = buildRootId;
@@ -601,17 +635,39 @@ List<Source> Source::parse(const String &cmdLine, const Path &base, unsigned int
             source.language = hasDashX ? language : guessLanguageFromSourceFile(input.second, language);
         }
     }
+    if (testLog(Warning))
+        warning() << "Parsed Source(s) successfully:" << ret;
     return ret;
+}
+// returns false if at end
+static inline bool advance(Set<Source::Define>::const_iterator &it, const Set<Source::Define>::const_iterator end)
+{
+    while (it != end) {
+        if (it->define != "NDEBUG")
+            return true;
+        ++it;
+    }
+    return false;
 }
 
 static inline bool compareDefinesNoNDEBUG(const Set<Source::Define> &l, const Set<Source::Define> &r)
 {
-    for (const auto &ld : l) {
-        if (ld.define != "NDEBUG") {
-            continue;
-        } else if (!r.contains(ld)) {
+    auto lit = l.begin();
+    auto rit = r.begin();
+    while (true) {
+        if (!advance(lit, l.end())) {
+            if (advance(rit, r.end()))
+                return false;
+            break;
+        } else if (!advance(rit, r.end())) {
             return false;
         }
+
+        if (*lit != *rit) {
+            return false;
+        }
+        ++lit;
+        ++rit;
     }
     return true;
 }
@@ -645,8 +701,9 @@ bool Source::compareArguments(const Source &other) const
 
     const bool separateDebugAndRelease = Server::instance()->options().options & Server::SeparateDebugAndRelease;
     if (separateDebugAndRelease) {
-        if (defines != other.defines)
+        if (defines != other.defines) {
             return false;
+        }
     } else if (!compareDefinesNoNDEBUG(defines, other.defines)) {
         return false;
     }
@@ -661,12 +718,18 @@ bool Source::compareArguments(const Source &other) const
             break;
         if (!nextArg(him, hisEnd, separateDebugAndRelease))
             return false;
-        if (*me != *him)
+        if (*me != *him) {
             return false;
+        }
         ++me;
         ++him;
     }
-    return him == hisEnd || !nextArg(him, hisEnd, separateDebugAndRelease);
+    if (him == hisEnd) {
+        return true;
+    } else if (!nextArg(him, hisEnd, separateDebugAndRelease)) {
+        return true;
+    }
+    return false;
 }
 
 List<String> Source::toCommandLine(unsigned int flags) const
@@ -714,6 +777,9 @@ List<String> Source::toCommandLine(unsigned int flags) const
             case Source::Include::Type_System:
                 ret << "-isystem" << inc.path;
                 break;
+            case Source::Include::Type_SystemFramework:
+                ret << "-iframework" << inc.path;
+                break;
             }
         }
         if (!(flags & ExcludeDefaultIncludePaths)) {
@@ -730,6 +796,9 @@ List<String> Source::toCommandLine(unsigned int flags) const
                     break;
                 case Source::Include::Type_System:
                     ret << "-isystem" << inc.path;
+                    break;
+                case Source::Include::Type_SystemFramework:
+                    ret << "-iframework" << inc.path;
                     break;
                 }
             }

@@ -20,14 +20,14 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include "RTags.h"
 
 enum {
-    DefaultFlags = Job::WriteUnfiltered|Job::QuietJob,
-    ElispFlags = DefaultFlags|Job::QuoteOutput
+    DefaultFlags = QueryJob::WriteUnfiltered|QueryJob::QuietJob,
+    ElispFlags = DefaultFlags|QueryJob::QuoteOutput
 };
 
 
-ListSymbolsJob::ListSymbolsJob(const QueryMessage &query, const std::shared_ptr<Project> &proj)
-    : Job(query, query.flags() & QueryMessage::ElispList ? ElispFlags : DefaultFlags, proj),
-      string(query.query())
+ListSymbolsJob::ListSymbolsJob(const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &proj)
+    : QueryJob(query, query->flags() & QueryMessage::ElispList ? ElispFlags : DefaultFlags, proj),
+      string(query->query())
 {
 }
 
@@ -118,7 +118,7 @@ Set<String> ListSymbolsJob::imenu(const std::shared_ptr<Project> &project)
 Set<String> ListSymbolsJob::listSymbols(const std::shared_ptr<Project> &project)
 {
     Set<String> out;
-    const bool hasFilter = Job::hasFilter();
+    const bool hasFilter = QueryJob::hasFilter();
     const bool stripParentheses = queryFlags() & QueryMessage::StripParentheses;
     const bool wildcard = queryFlags() & QueryMessage::WildcardSymbolNames && (string.contains('*') || string.contains('?'));
     const bool caseInsensitive = queryFlags() & QueryMessage::MatchCaseInsensitive;
@@ -143,9 +143,8 @@ Set<String> ListSymbolsJob::listSymbols(const std::shared_ptr<Project> &project)
     const SymbolNameMap &map = project->symbolNames();
     SymbolNameMap::const_iterator it = string.isEmpty() || caseInsensitive ? map.begin() : map.lower_bound(lowerBound);
     int count = 0;
-    while (it != map.end()) {
+    for (; it != map.end(); ++it) {
         const String &entry = it->first;
-        ++it;
         if (!string.isEmpty()) {
             if (wildcard) {
                 if (!Rct::wildCmp(string.constData(), entry.constData(), cs)) {

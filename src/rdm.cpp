@@ -34,13 +34,8 @@ static void sigSegvHandler(int signal)
     if (Server *server = Server::instance())
         server->stopServers();
     fprintf(stderr, "Caught signal %d\n", signal);
-    // this is not really allowed in signal handlers but will mostly work
-    const List<String>& trace = RTags::backtrace();
-    auto it = trace.cbegin();
-    while (it != trace.end()) {
-        fprintf(stderr, "%s", it->constData());
-        ++it;
-    }
+    const String trace = Rct::backtrace();
+    fprintf(stderr, "%s\n", trace.constData());
     fflush(stderr);
     _exit(1);
 }
@@ -63,61 +58,67 @@ static size_t defaultStackSize = 0;
 static void usage(FILE *f)
 {
     fprintf(f,
-            "rdm [...options...]\n"
+            "\nUsage: rdm [...options...]\n\n"
             "  --help|-h                                  Display this page.\n"
-            "  --server|-s [arg]                          Run as server with no arg or connect to arg as server.\n"
-            "  --enable-job-server|-z                     Enable job server.\n"
-            "  --include-path|-I [arg]                    Add additional include path to clang.\n"
-            "  --isystem|-s [arg]                         Add additional system include path to clang.\n"
-            "  --define|-D [arg]                          Add additional define directive to clang.\n"
-            "  --log-file|-L [arg]                        Log to this file.\n"
-            "  --append|-A                                Append to log file.\n"
-            "  --verbose|-v                               Change verbosity, multiple -v's are allowed.\n"
+
+            "\nServer options:\n"
             "  --clear-project-caches|-C                  Clear out project caches.\n"
-            "  --disable-sighandler|-x                    Disable signal handler to dump stack for crashes.\n"
-            "  --clang-includepath|-P                     Use clang include paths by default.\n"
-            "  --no-Wall|-W                               Don't use -Wall.\n"
-            "  --allow-Wpedantic|-P                       Don't strip out -Wpedantic. This can cause problems in certain projects.\n"
-            "  --Wlarge-by-value-copy|-r [arg]            Use -Wlarge-by-value-copy=[arg] when invoking clang.\n"
-            "  --no-spell-checking|-l                     Don't pass -fspell-checking.\n"
-            "  --no-unlimited-error|-f                    Don't pass -ferror-limit=0 to clang.\n"
-            "  --silent|-S                                No logging to stdout.\n"
-            "  --exclude-filter|-X [arg]                  Files to exclude from rdm, default \"" EXCLUDEFILTER_DEFAULT "\".\n"
-            "  --sync-threshold|-y [arg]                  Automatically sync after [arg] files indexed.\n"
-            "  --no-rc|-N                                 Don't load any rc files.\n"
-            "  --ignore-printf-fixits|-F                  Disregard any clang fixit that looks like it's trying to fix format for printf and friends.\n"
+            "  --test|-J [arg]                            Run this test.\n"
+            "  --test-timeout|-z [arg]                    Timeout for test to complete.\n"
+            "  --completion-cache-size|-i [arg]           Number of translation units to cache (default " STR(DEFAULT_COMPLETION_CACHE_SIZE) ").\n"
             "  --config|-c [arg]                          Use this file instead of ~/.rdmrc.\n"
             "  --data-dir|-d [arg]                        Use this directory to store persistent data (default ~/.rtags).\n"
-            "  --socket-file|-n [arg]                     Use this file for the server socket (default ~/.rdm).\n"
-            "  --tcp-port|-p [arg]                        Use this port for tcp server (default " STR(DEFAULT_RDM_TCP_PORT) ").\n"
-            "  --setenv|-e [arg]                          Set this environment variable (--setenv \"foobar=1\").\n"
-            "  --no-startup-project|-o                    Don't restore the last current project on startup.\n"
+            "  --disable-sighandler|-x                    Disable signal handler to dump stack for crashes.\n"
             "  --disallow-multiple-sources|-m             With this setting different sources will be merged for each source file.\n"
-            "  --separate-debug-and-release|-E            Normally rdm doesn't consider release and debug as different builds. Pass this if you want it to.\n"
-            "  --unload-timer|-u [arg]                    Number of minutes to wait before unloading non-current projects (disabled by default).\n"
-            "  --job-count|-j [arg]                       Spawn this many concurrent processes for indexing (default %d).\n"
-            "  --watch-system-paths|-w                    Watch system paths for changes.\n"
-            "  --rp-visit-file-timeout|-t [arg]           Timeout for rp visitfile commands in ms (0 means no timeout) (default " STR(DEFAULT_RP_VISITFILE_TIMEOUT) ").\n"
-            "  --rp-indexer-message-timeout|-T [arg]      Timeout for rp indexer-message in ms (0 means no timeout) (default " STR(DEFAULT_RP_INDEXER_MESSAGE_TIMEOUT) ").\n"
-            "  --rp-connect-timeout|-O [arg]              Timeout for connection from rp to rdm in ms (0 means no timeout) (default " STR(DEFAULT_RP_CONNECT_TIMEOUT) ").\n"
-            "  --rp-nice-value|-a [arg]                   Nice value to use for rp (nice(2)) (default -1, e.g. not nicing).\n"
+            "  --enable-NDEBUG|-g                         Don't remove -DNDEBUG from compile lines.\n"
+            "  --enable-compiler-manager|-R               Query compilers for their actual include paths instead of letting clang use its own.\n"
+            "  --exclude-filter|-X [arg]                  Files to exclude from rdm, default \"" EXCLUDEFILTER_DEFAULT "\".\n"
+            "  --extra-compilers|-U [arg]                 Override additional \"known\" compilers. E.g. -U foobar;c++, foobar;c or foobar:objective-c or just foobar.\n"
+
 #ifdef OS_Darwin
             "  --filemanager-watch|-M                     Use a file system watcher for filemanager.\n"
-#else
+#endif
+
+            "  --job-count|-j [arg]                       Spawn this many concurrent processes for indexing (default %d).\n"
+            "  --log-file|-L [arg]                        Log to this file.\n"
+
+#ifndef OS_Darwin
             "  --no-filemanager-watch|-M                  Don't use a file system watcher for filemanager.\n"
 #endif
-            "  --enable-NDEBUG|-g                         Don't remove -DNDEBUG from compile lines.\n"
-            "  --start-suspended|-Q                       Start out suspended (no reindexing enabled).\n"
             "  --no-filesystem-watcher|-B                 Disable file system watching altogether. Reindexing has to happen manually.\n"
+            "  --no-rc|-N                                 Don't load any rc files.\n"
+            "  --no-startup-project|-o                    Don't restore the last current project on startup.\n"
+            "  --rp-connect-timeout|-O [arg]              Timeout for connection from rp to rdm in ms (0 means no timeout) (default " STR(DEFAULT_RP_CONNECT_TIMEOUT) ").\n"
+            "  --rp-indexer-message-timeout|-T [arg]      Timeout for rp indexer-message in ms (0 means no timeout) (default " STR(DEFAULT_RP_INDEXER_MESSAGE_TIMEOUT) ").\n"
+            "  --rp-nice-value|-a [arg]                   Nice value to use for rp (nice(2)) (default -1, e.g. not nicing).\n"
+            "  --rp-visit-file-timeout|-J [arg]           Timeout for rp visitfile commands in ms (0 means no timeout) (default " STR(DEFAULT_RP_VISITFILE_TIMEOUT) ").\n"
+            "  --separate-debug-and-release|-E            Normally rdm doesn't consider release and debug as different builds. Pass this if you want it to.\n"
+            "  --setenv|-e [arg]                          Set this environment variable (--setenv \"foobar=1\").\n"
+            "  --silent|-S                                No logging to stdout.\n"
+            "  --socket-file|-n [arg]                     Use this file for the server socket (default ~/.rdm).\n"
+            "  --start-suspended|-Q                       Start out suspended (no reindexing enabled).\n"
             "  --suspend-rp-on-crash|-q [arg]             Suspend rp in SIGSEGV handler (default " DEFAULT_SUSPEND_RP ").\n"
-            "  --no-no-unknown-warnings-option|-Y         Don't pass -Wno-unknown-warning-option\n"
-            "  --ignore-compiler|-b [arg]                 Alias this compiler (Might be practical to avoid duplicated sources for things like icecc).\n"
+            "  --sync-threshold|-y [arg]                  Automatically sync after [arg] files indexed.\n"
             "  --thread-stack-size|-k [arg]               Set stack size for threadpool to this (default %zu).\n"
-            "  --completion-cache-size|-i [arg]           Number of translation units to cache (default " STR(DEFAULT_COMPLETION_CACHE_SIZE) ").\n"
-            "  --extra-compilers|-U [arg]                 Override additional \"known\" compilers. E.g. -U foobar;c++, foobar;c or foobar:objective-c or just foobar.\n"
-            "  --enable-compiler-manager|-R               Query compilers for their actual include paths instead of letting clang use its own.\n"
-            "  --max-crash-count|-K [arg]                 Number of restart attempts for a translation unit when rp crashes (default " STR(DEFAULT_MAX_CRASH_COUNT) ").\n",
-            std::max(2, ThreadPool::idealThreadCount()), defaultStackSize);
+            "  --unload-timer|-u [arg]                    Number of minutes to wait before unloading non-current projects (disabled by default).\n"
+            "  --verbose|-v                               Change verbosity, multiple -v's are allowed.\n"
+            "  --watch-system-paths|-w                    Watch system paths for changes.\n"
+            "  --block-argument|-G [arg]                  Block this argument from being passed to clang. E.g. rdm --block-argument -fno-inline\n"
+            "  --no-progress|-p                           Don't report compilation progress in xml output.\n"
+            "  --cache-AST|-A [maxsize]                   Cache this many AST units in $DATA_DIR/astcache.\n"
+            "\nCompiling/Indexing options:\n"
+            "  --allow-Wpedantic|-P                       Don't strip out -Wpedantic. This can cause problems in certain projects.\n"
+            "  --define|-D [arg]                          Add additional define directive to clang.\n"
+            "  --ignore-printf-fixits|-F                  Disregard any clang fixit that looks like it's trying to fix format for printf and friends.\n"
+            "  --include-path|-I [arg]                    Add additional include path to clang.\n"
+            "  --isystem|-s [arg]                         Add additional system include path to clang.\n"
+            "  --no-Wall|-W                               Don't use -Wall.\n"
+            "  --no-no-unknown-warnings-option|-Y         Don't pass -Wno-unknown-warning-option\n"
+            "  --no-spell-checking|-l                     Don't pass -fspell-checking.\n"
+            "  --no-unlimited-error|-f                    Don't pass -ferror-limit=0 to clang.\n"
+            "  --Wlarge-by-value-copy|-r [arg]            Use -Wlarge-by-value-copy=[arg] when invoking clang.\n"
+            "  --arg-transform|-V [arg]                   Use arg to transform arguments. [arg] should be a executable with (execv(3)).\n"
+            , std::max(2, ThreadPool::idealThreadCount()), defaultStackSize);
 }
 
 int main(int argc, char** argv)
@@ -136,17 +137,17 @@ int main(int argc, char** argv)
 
     struct option opts[] = {
         { "help", no_argument, 0, 'h' },
-        { "enable-job-server", no_argument, 0, 'z' },
-        { "compression", required_argument, 0, 'Z' },
         { "include-path", required_argument, 0, 'I' },
         { "isystem", required_argument, 0, 's' },
         { "define", required_argument, 0, 'D' },
         { "log-file", required_argument, 0, 'L' },
         { "setenv", required_argument, 0, 'e' },
         { "no-Wall", no_argument, 0, 'W' },
-        { "append", no_argument, 0, 'A' },
+        { "cache-AST", required_argument, 0, 'A' },
         { "verbose", no_argument, 0, 'v' },
         { "job-count", required_argument, 0, 'j' },
+        { "test", required_argument, 0, 't' },
+        { "test-timeout", required_argument, 0, 'z' },
         { "clean-slate", no_argument, 0, 'C' },
         { "disable-sighandler", no_argument, 0, 'x' },
         { "silent", no_argument, 0, 'S' },
@@ -157,6 +158,7 @@ int main(int argc, char** argv)
         { "data-dir", required_argument, 0, 'd' },
         { "ignore-printf-fixits", no_argument, 0, 'F' },
         { "no-unlimited-errors", no_argument, 0, 'f' },
+        { "block-argument", required_argument, 0, 'G' },
         { "no-spell-checking", no_argument, 0, 'l' },
         { "sync-threshold", required_argument, 0, 'y' },
         { "large-by-value-copy", required_argument, 0, 'r' },
@@ -166,7 +168,7 @@ int main(int argc, char** argv)
         { "no-no-unknown-warnings-option", no_argument, 0, 'Y' },
         { "ignore-compiler", required_argument, 0, 'b' },
         { "watch-system-paths", no_argument, 0, 'w' },
-        { "rp-visit-file-timeout", required_argument, 0, 't' },
+        { "rp-visit-file-timeout", required_argument, 0, 'J' },
         { "rp-indexer-message-timeout", required_argument, 0, 'T' },
         { "rp-connect-timeout", required_argument, 0, 'O' },
         { "rp-nice-value", required_argument, 0, 'a' },
@@ -180,12 +182,14 @@ int main(int argc, char** argv)
         { "allow-Wpedantic", no_argument, 0, 'P' },
         { "enable-compiler-manager", no_argument, 0, 'R' },
         { "enable-NDEBUG", no_argument, 0, 'g' },
+        { "no-progress", no_argument, 0, 'p' },
 #ifdef OS_Darwin
         { "filemanager-watch", no_argument, 0, 'M' },
 #else
         { "no-filemanager-watch", no_argument, 0, 'M' },
 #endif
         { "no-filesystem-watcher", no_argument, 0, 'B' },
+        { "arg-transform", required_argument, 0, 'V' },
         { 0, 0, 0, 0 }
     };
     const String shortOptions = Rct::shortOptions(opts);
@@ -329,6 +333,9 @@ int main(int argc, char** argv)
         case 'X':
             serverOpts.excludeFilters += String(optarg).split(';');
             break;
+        case 'G':
+            serverOpts.blockedArguments << optarg;
+            break;
         case 'U': {
             Source::Language lang = Source::NoLanguage;
             RegExp rx;
@@ -363,10 +370,10 @@ int main(int argc, char** argv)
         case 'Q':
             serverOpts.options |= Server::StartSuspended;
             break;
-        case 't':
+        case 'J':
             serverOpts.rpVisitFileTimeout = atoi(optarg);
             if (serverOpts.rpVisitFileTimeout < 0) {
-                fprintf(stderr, "Invalid argument to -t %s\n", optarg);
+                fprintf(stderr, "Invalid argument to -J %s\n", optarg);
                 return 1;
             }
             if (!serverOpts.rpVisitFileTimeout)
@@ -389,6 +396,21 @@ int main(int argc, char** argv)
         case 'b':
             serverOpts.ignoredCompilers.insert(Path::resolved(optarg));
             break;
+        case 't': {
+            Path test(optarg);
+            if (!test.resolve() || !test.isFile()) {
+                fprintf(stderr, "%s doesn't seem to be a file\n", optarg);
+                return 1;
+            }
+            serverOpts.tests += test;
+            break; }
+        case 'z':
+            serverOpts.testTimeout = atoi(optarg);
+            if (serverOpts.testTimeout <= 0) {
+                fprintf(stderr, "Invalid argument to -z %s\n", optarg);
+                return 1;
+            }
+            break;
         case 'n':
             serverOpts.socketFile = optarg;
             break;
@@ -400,6 +422,9 @@ int main(int argc, char** argv)
             return 0;
         case 'Y':
             serverOpts.options |= Server::NoNoUnknownWarningsOption;
+            break;
+        case 'p':
+            serverOpts.options |= Server::NoProgress;
             break;
         case 'R':
             serverOpts.options |= Server::EnableCompilerManager;
@@ -433,7 +458,15 @@ int main(int argc, char** argv)
         case 'B':
             serverOpts.options |= Server::NoFileSystemWatch;
             break;
-        case 'F':
+        case 'V':
+            serverOpts.argTransform = Process::findCommand(optarg);
+            if (strlen(optarg) && serverOpts.argTransform.isEmpty()) {
+                fprintf(stderr, "Invalid argument to -V. Can't resolve %s", optarg);
+                return 1;
+            }
+
+            break;
+      case 'F':
             serverOpts.options |= Server::IgnorePrintfFixits;
             break;
         case 'f':
@@ -533,9 +566,14 @@ int main(int argc, char** argv)
         case 's':
             serverOpts.includePaths.append(Source::Include(Source::Include::Type_System, Path::resolved(optarg)));
             break;
-        case 'A':
-            logFlags |= Log::Append;
-            break;
+        case 'A': {
+            bool ok;
+            serverOpts.astCache = String(optarg).toLongLong(&ok);
+            if (!ok || serverOpts.astCache < 0) {
+                fprintf(stderr, "Invalid arg to --cache-AST %s\n", optarg);
+                return 1;
+            }
+            break; }
         case 'L':
             logFile = optarg;
             break;
@@ -544,7 +582,7 @@ int main(int argc, char** argv)
                 ++logLevel;
             break;
         case '?': {
-            fprintf(stderr, "Run rc --help for help\n");
+            fprintf(stderr, "Run rdm --help for help\n");
             return 1; }
         }
     }
@@ -556,7 +594,10 @@ int main(int argc, char** argv)
     if (sigHandler)
         signal(SIGSEGV, sigSegvHandler);
 
-    if (!initLogging(argv[0], LogStderr, logLevel, logFile, logFlags)) {
+    // Shell-expand logFile
+    Path logPath(logFile); logPath.resolve();
+
+    if (!initLogging(argv[0], LogStderr, logLevel, logPath.constData(), logFlags)) {
         fprintf(stderr, "Can't initialize logging with %d %s 0x%0x\n",
                 logLevel, logFile ? logFile : "", logFlags);
         return 1;
@@ -566,10 +607,36 @@ int main(int argc, char** argv)
     loop->init(EventLoop::MainEventLoop|EventLoop::EnableSigIntHandler);
 
     std::shared_ptr<Server> server(new Server);
+    if (!serverOpts.tests.isEmpty()) {
+        char buf[1024];
+        Path path;
+        while (true) {
+            strcpy(buf, "/tmp/rtags-test-XXXXXX");
+            if (!mkdtemp(buf)) {
+                fprintf(stderr, "Failed to mkdtemp (%d)\n", errno);
+                return 1;
+            }
+            path = buf;
+            path.resolve();
+            break;
+        }
+        serverOpts.dataDir = path;
+        strcpy(buf, "/tmp/rtags-sock-XXXXXX");
+        if (!mkstemp(buf)) {
+            fprintf(stderr, "Failed to mkstemp (%d)\n", errno);
+            return 1;
+        }
+        serverOpts.socketFile = buf;
+        serverOpts.socketFile.resolve();
+    }
     serverOpts.dataDir = serverOpts.dataDir.ensureTrailingSlash();
     if (!server->init(serverOpts)) {
         cleanupLogging();
         return 1;
+    }
+
+    if (!serverOpts.tests.isEmpty()) {
+        return server->runTests() ? 0 : 1;
     }
 
     loop->exec();

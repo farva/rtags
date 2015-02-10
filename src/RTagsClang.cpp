@@ -75,7 +75,7 @@ String cursorToString(CXCursor cursor, unsigned flags)
 
     CXString file;
     unsigned line, col;
-    for (int pieceIndex = 0;; ++pieceIndex) {
+    for (int pieceIndex = 0; true; ++pieceIndex) {
         CXSourceRange range = clang_Cursor_getSpellingNameRange(cursor, pieceIndex, 0);
         if (clang_Range_isNull(range))
             break;
@@ -141,17 +141,27 @@ void parseTranslationUnit(const Path &sourceFile, const List<String> &args,
     if (clangLine)
         *clangLine += sourceFile;
 
-    StopWatch sw;
+    // StopWatch sw;
+#if CINDEX_VERSION_MINOR >= 23
+    for (int i=0; i<3; ++i) {
+        auto error = clang_parseTranslationUnit2(index, sourceFile.constData(),
+                                                 clangArgs.data(), idx, unsaved, unsavedCount,
+                                                 translationUnitFlags, &unit);
+        if (error != CXError_Crashed)
+            break;
+    }
+#else
     unit = clang_parseTranslationUnit(index, sourceFile.constData(),
                                       clangArgs.data(), idx, unsaved, unsavedCount,
                                       translationUnitFlags);
+#endif
     // error() << sourceFile << sw.elapsed();
 }
 
 void reparseTranslationUnit(CXTranslationUnit &unit, CXUnsavedFile *unsaved, int unsavedCount)
 {
     assert(unit);
-    if (clang_reparseTranslationUnit(unit, 0, unsaved, clang_defaultReparseOptions(unit)) != 0) {
+    if (clang_reparseTranslationUnit(unit, unsavedCount, unsaved, clang_defaultReparseOptions(unit)) != 0) {
         clang_disposeTranslationUnit(unit);
         unit = 0;
     }

@@ -18,13 +18,13 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 
 #include <rct/String.h>
 #include <rct/List.h>
-#include "Job.h"
+#include "QueryJob.h"
 
 class QueryMessage;
-class StatusJob : public Job
+class StatusJob : public QueryJob
 {
 public:
-    StatusJob(const QueryMessage &query, const std::shared_ptr<Project> &project);
+    StatusJob(const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &project);
     static const char *delimiter;
 protected:
     virtual int execute();

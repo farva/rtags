@@ -19,13 +19,12 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include "VisitFileMessage.h"
 #include "VisitFileResponseMessage.h"
 #include "IndexerMessage.h"
-#include "CompileMessage.h"
+#include "IndexMessage.h"
 #include "LogOutputMessage.h"
 #include "QueryMessage.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <fnmatch.h>
-#include <rct/Messages.h>
 #include <rct/Rct.h>
 #include <rct/StopWatch.h>
 #include <sys/types.h>
@@ -37,82 +36,6 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #endif
 
 namespace RTags {
-
-#ifdef HAVE_BACKTRACE
-#include <execinfo.h>
-#include <cxxabi.h>
-
-static inline char *demangle(const char *str)
-{
-    if (!str)
-        return 0;
-    int status;
-#ifdef OS_Darwin
-    char paren[1024];
-    sscanf(str, "%*d %*s %*s %s %*s %*d", paren);
-#else
-    const char *paren = strchr(str, '(');
-    if (!paren) {
-        paren = str;
-    } else {
-        ++paren;
-    }
-#endif
-    size_t l;
-    if (const char *plus = strchr(paren, '+')) {
-        l = plus - paren;
-    } else {
-        l = strlen(paren);
-    }
-
-    char buf[1024];
-    size_t len = sizeof(buf);
-    if (l >= len)
-        return 0;
-    memcpy(buf, paren, l + 1);
-    buf[l] = '\0';
-    char *ret = abi::__cxa_demangle(buf, 0, 0, &status);
-    if (status != 0) {
-        if (ret)
-            free(ret);
-#ifdef OS_Darwin
-        return strdup(paren);
-#else
-        return 0;
-#endif
-    }
-    return ret;
-}
-
-List<String> backtrace(int maxFrames)
-{
-    enum { SIZE = 1024 };
-    void *stack[SIZE];
-
-    int frameCount = backtrace(stack, sizeof(stack) / sizeof(void*));
-    if (frameCount <= 0)
-        return List<String>();
-    List<String> ret;
-    char **symbols = backtrace_symbols(stack, frameCount);
-    if (symbols) {
-        char frame[1024];
-        for (int i=1; i<frameCount && (maxFrames < 0 || i - 1 < maxFrames); ++i) {
-            char *demangled = demangle(symbols[i]);
-            snprintf(frame, sizeof(frame), "%d/%d %s", i, frameCount - 1, demangled ? demangled : symbols[i]);
-            ret.append(frame);
-            if (demangled)
-                free(demangled);
-        }
-        free(symbols);
-    }
-    return ret;
-}
-#else
-List<String> backtrace(int)
-{
-    return List<String>();
-}
-#endif
 
 void dirtySymbolNames(SymbolNameMap &map, const Set<uint32_t> &dirty)
 {
@@ -315,8 +238,10 @@ Path findProjectRoot(const Path &path, ProjectRootMode mode)
             { "GTAGS", 0 },
             { "CMakeLists.txt", 0 },
             { "configure", 0 },
+            { ".tup", 0 },
             { ".git", 0 },
             { ".svn", 0 },
+            { ".bzr", 0 },
             { "*.pro", Wildcard },
             { "scons.1", 0 },
             { "*.scons", Wildcard },
@@ -446,11 +371,11 @@ Path findProjectRoot(const Path &path, ProjectRootMode mode)
 
 void initMessages()
 {
-    Messages::registerMessage<CompileMessage>();
-    Messages::registerMessage<IndexerMessage>();
-    Messages::registerMessage<LogOutputMessage>();
-    Messages::registerMessage<QueryMessage>();
-    Messages::registerMessage<VisitFileMessage>();
-    Messages::registerMessage<VisitFileResponseMessage>();
+    Message::registerMessage<IndexMessage>();
+    Message::registerMessage<IndexerMessage>();
+    Message::registerMessage<LogOutputMessage>();
+    Message::registerMessage<QueryMessage>();
+    Message::registerMessage<VisitFileMessage>();
+    Message::registerMessage<VisitFileResponseMessage>();
 }
 }

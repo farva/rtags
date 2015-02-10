@@ -1,3 +1,18 @@
+/* This file is part of RTags.
+
+   RTags is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   RTags is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
+
 #ifndef ClangIndexer_h
 #define ClangIndexer_h
 
@@ -23,6 +38,8 @@ private:
     bool diagnose();
     bool visit();
     bool parse();
+    bool loadFromCache();
+    String shaFile(const Path &path) const;
 
     void addFileSymbol(uint32_t file);
     inline Location createLocation(const CXSourceLocation &location, bool *blocked = 0)
@@ -91,7 +108,7 @@ private:
         return createLocation(clang_getRangeStart(range), blocked);
     }
     Location createLocation(const Path &file, unsigned int line, unsigned int col, bool *blocked = 0);
-    String addNamePermutations(const CXCursor &cursor, const Location &location);
+    String addNamePermutations(const CXCursor &cursor, const Location &location, String typeOverride);
 
     CXCursor resolveAutoTypeRef(const CXCursor &cursor) const;
 
@@ -111,25 +128,26 @@ private:
     static void inclusionVisitor(CXFile includedFile, CXSourceLocation *includeStack,
                                  unsigned includeLen, CXClientData userData);
 
-    void onMessage(Message *msg, Connection *conn);
+    void onMessage(const std::shared_ptr<Message> &msg, Connection *conn);
 
     Path mProject;
     Source mSource;
     Path mSourceFile;
     std::shared_ptr<IndexData> mData;
     CXTranslationUnit mClangUnit;
+    bool mLoadedFromCache;
     CXIndex mIndex;
     CXCursor mLastCursor;
     String mClangLine;
     uint32_t mVisitFileResponseMessageFileId;
     bool mVisitFileResponseMessageVisit;
-    Path mSocketFile;
+    Path mSocketFile, mASTCacheDir;
     StopWatch mTimer;
     int mParseDuration, mVisitDuration, mBlocked, mAllowed,
         mIndexed, mVisitFileTimeout, mIndexerMessageTimeout, mFileIdsQueried;
     UnsavedFiles mUnsavedFiles;
-    Connection mConnection;
     FILE *mLogFile;
+    Connection mConnection;
     uint32_t mLastFileId;
     bool mLastBlocked;
     Path mLastFile;

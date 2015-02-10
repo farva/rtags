@@ -19,14 +19,14 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include "CursorInfo.h"
 #include "Project.h"
 
-ReferencesJob::ReferencesJob(const Location &loc, const QueryMessage &query, const std::shared_ptr<Project> &proj)
-    : Job(query, 0, proj)
+ReferencesJob::ReferencesJob(const Location &loc, const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &proj)
+    : QueryJob(query, 0, proj)
 {
     locations.insert(loc);
 }
 
-ReferencesJob::ReferencesJob(const String &sym, const QueryMessage &query, const std::shared_ptr<Project> &proj)
-    : Job(query, 0, proj), symbolName(sym)
+ReferencesJob::ReferencesJob(const String &sym, const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &proj)
+    : QueryJob(query, 0, proj), symbolName(sym)
 {
 }
 

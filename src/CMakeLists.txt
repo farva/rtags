@@ -3,6 +3,16 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif ()
 
+SET(CMAKE_SKIP_BUILD_RPATH            FALSE)
+SET(CMAKE_BUILD_WITH_INSTALL_RPATH    FALSE)
+SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Set RPATH when installing to a custom (non-system) directory
+LIST(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/lib" isSystemDir)
+IF("${isSystemDir}" STREQUAL "-1")
+  SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+ENDIF("${isSystemDir}" STREQUAL "-1")
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstack-protector-all")
@@ -13,16 +23,30 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wstack-protector")
 
 include(${CMAKE_SOURCE_DIR}/cmake/EnsureLibraries.cmake)
 
-find_package(LLVM REQUIRED)
-find_package(Clang REQUIRED)
-find_package(LibClang REQUIRED)
+if (NOT DEFINED CLANG_LIBS)
+  set(CLANG_LIBS $ENV{CLANG_LIBS})
+endif()
+
+if (NOT DEFINED CLANG_INCLUDE)
+  set(CLANG_LIBS $ENV{CLANG_INCLUDE})
+endif()
+
+if (NOT DEFINED CLANG_SYSTEM_INCLUDE)
+  set(CLANG_LIBS $ENV{CLANG_SYSTEM_INCLUDE})
+endif()
+
+if (NOT DEFINED CLANG_LIBS OR NOT DEFINED CLANG_INCLUDE OR NOT DEFINED CLANG_SYSTEMINCLUDE)
+  find_package(LibClang REQUIRED)
+endif ()
+
 include_directories(${CLANG_INCLUDE})
-include_directories(${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 
 if (EXISTS ${CLANG_COMPILATION_INCLUDE})
   add_definitions(-DHAVE_CXCOMPILATIONDATABASE)
 endif ()
 
+set(RCT_STATIC 1)
+set(RCT_NO_INSTALL 1)
 add_subdirectory(rct)
 
 include(${CMAKE_CURRENT_LIST_DIR}/rct/compiler.cmake)
@@ -36,15 +60,13 @@ endif ()
 
 add_definitions("-Wall")
 add_definitions("-DCLANG_INCLUDEPATH=${CLANG_SYSTEM_INCLUDE}")
-add_definitions("-DCLANG_VERSION_MAJOR=${CLANG_VERSION_MAJOR}")
-add_definitions("-DCLANG_VERSION_MINOR=${CLANG_VERSION_MINOR}")
 add_definitions("-DOS_${CMAKE_SYSTEM_NAME}")
 
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
-  set(SYSTEM_LIBS pthread rt crypto m dl)
+  set(SYSTEM_LIBS pthread rt crypto m dl curses)
 elseif (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
   add_definitions(-D__LONG_LONG_SUPPORTED)
-  set(SYSTEM_LIBS pthread crypto)
+  set(SYSTEM_LIBS pthread crypto curses)
 elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
   set(SYSTEM_LIBS crypto curses)
   find_program(SW_VER sw_vers)
@@ -56,27 +78,28 @@ elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
     #   set(HAVE_FSEVENTS 1)
   endif ()
 endif ()
-list(APPEND SYSTEM_LIBS ${LLVM_LDFLAGS})
+# list(APPEND SYSTEM_LIBS ${LLVM_LDFLAGS})
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 add_definitions("-DRTAGS_BIN=\"${PROJECT_BINARY_DIR}/bin/\"")
 
 set(RTAGS_SHARED_SOURCES
-  CompileMessage.cpp
+  IndexMessage.cpp
   LogOutputMessage.cpp
   Location.cpp
   QueryMessage.cpp
   RTags.cpp)
 
-add_library(shared SHARED ${RTAGS_SHARED_SOURCES})
+add_library(shared STATIC ${RTAGS_SHARED_SOURCES})
 target_link_libraries(shared rct)
 
-set(RDM_SOURCES
+set(RTAGS_SOURCES
     CompilerManager.cpp
     CompletionThread.cpp
     CursorInfo.cpp
     CursorInfoJob.cpp
     DependenciesJob.cpp
+    Diagnostic.cpp
     DumpThread.cpp
     EventSourceClient.cpp
     FileManager.cpp
@@ -84,10 +107,11 @@ set(RDM_SOURCES
     FindSymbolsJob.cpp
     FollowLocationJob.cpp
     IndexerJob.cpp
-    Job.cpp
+    JobScheduler.cpp
     ListSymbolsJob.cpp
     Preprocessor.cpp
     Project.cpp
+    QueryJob.cpp
     RTagsClang.cpp
     ReferencesJob.cpp
     ScanThread.cpp
@@ -100,7 +124,7 @@ include_directories(${CMAKE_CURRENT_LIST_DIR}
                     rct
                     ${CMAKE_CURRENT_BINARY_DIR}/rct/include/rct)
 
-link_directories(${LLVM_LIBRARY_DIRS})
+# link_directories(${LLVM_LIBRARY_DIRS})
 
 if (CMAKE_SYSTEM_NAME MATCHES "Darwin")
   set(START_GROUP "")
@@ -124,13 +148,13 @@ add_executable(rc rc.cpp RClient.cpp)
 add_dependencies(rc rct shared)
 target_link_libraries(rc shared rct ${SYSTEM_LIBS})
 
-add_library(rtags SHARED ${RDM_SOURCES})
+add_library(rtags STATIC ${RTAGS_SOURCES})
 target_link_libraries(rtags
   rct
   shared
   ${START_GROUP}
   ${CLANG_LIBS}
-  ${LLVM_LIBNAMES}
+  # ${LLVM_LIBNAMES}
   ${END_GROUP}
   -lstdc++
   ${SYSTEM_LIBS})
@@ -140,8 +164,8 @@ add_executable(rdm rdm.cpp)
 target_link_libraries(rdm rtags -lstdc++ ${SYSTEM_LIBS})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
-set (RP_LIBRARIES rtags shared)
-set (RP_SOURCES rp.cpp ClangIndexer.cpp)
+set(RP_LIBRARIES rtags shared)
+set(RP_SOURCES rp.cpp ClangIndexer.cpp)
 
 add_executable(rp ${RP_SOURCES})
 target_link_libraries(rp ${RP_LIBRARIES})
@@ -157,17 +181,7 @@ if (NOT "${PROJECT_SOURCE_DIR}" STREQUAL "${PROJECT_BINARY_DIR}")
   file (COPY ${binFiles} DESTINATION "${PROJECT_BINARY_DIR}/bin")
 endif ()
 
-if (CMAKE_SYSTEM_NAME MATCHES "Darwin")
-  add_custom_command(TARGET rdm POST_BUILD
-    COMMAND ${CMAKE_CURRENT_LIST_DIR}/fix-dylib.sh ${PROJECT_BINARY_DIR} ${PROJECT_BINARY_DIR}/bin/rdm)
-  add_custom_command(TARGET rc POST_BUILD
-    COMMAND ${CMAKE_CURRENT_LIST_DIR}/fix-dylib.sh ${PROJECT_BINARY_DIR} ${PROJECT_BINARY_DIR}/bin/rc)
-endif ()
 
 install(CODE "message(\"Installing rtags...\")")
 install(TARGETS rdm rc rp RUNTIME DESTINATION bin COMPONENT rtags)
-install(TARGETS rtags shared LIBRARY DESTINATION lib COMPONENT rtags)
-install(FILES ../bin/cc_prefix.sh ../bin/gcc-rtags-hook.sh ../bin/gcc-rtags-wrapper.sh
-        DESTINATION bin
-        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 install(FILES ../man/rc.7 ../man/rdm.7 DESTINATION share/man/man7/)

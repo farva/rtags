@@ -30,12 +30,12 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include <rct/Timer.h>
 #include <rct/SocketServer.h>
 
-class CompileMessage;
+class IndexMessage;
 class CompletionThread;
 class Connection;
 class ErrorMessage;
 class IndexerMessage;
-class Job;
+class QueryJob;
 class JobOutput;
 class LogOutputMessage;
 class Message;
@@ -43,6 +43,7 @@ class OutputMessage;
 class Project;
 class QueryMessage;
 class VisitFileMessage;
+class JobScheduler;
 class Server
 {
 public:
@@ -67,104 +68,98 @@ public:
         AllowPedantic = 0x02000,
         StartSuspended = 0x04000,
         EnableCompilerManager = 0x08000,
-        EnableNDEBUG = 0x10000
+        EnableNDEBUG = 0x10000,
+        NoProgress = 0x20000
     };
     struct Options {
         Options()
             : options(0), jobCount(0), unloadTimer(0),
               rpVisitFileTimeout(0), rpIndexerMessageTimeout(0), rpConnectTimeout(0),
               rpNiceValue(0), syncThreshold(0), threadStackSize(0), maxCrashCount(0),
-              completionCacheSize(0)
+              completionCacheSize(0), astCache(0), testTimeout(60 * 1000 * 5)
         {}
-        Path socketFile, dataDir;
+        Path socketFile, dataDir, argTransform;
         unsigned options;
         int jobCount, unloadTimer, rpVisitFileTimeout,
             rpIndexerMessageTimeout, rpConnectTimeout, rpNiceValue,
-            syncThreshold, threadStackSize, maxCrashCount, completionCacheSize;
+            syncThreshold, threadStackSize, maxCrashCount, completionCacheSize, astCache,
+            testTimeout;
         List<String> defaultArguments, excludeFilters;
+        Set<String> blockedArguments;
         List<Source::Include> includePaths;
         List<Source::Define> defines;
+        List<Path> tests;
         Set<Path> ignoredCompilers;
         List<std::pair<RegExp, Source::Language> > extraCompilers;
+
+        inline bool flag(enum Option o) const { return 0 != (options & o); }
     };
     bool init(const Options &options);
+    bool runTests();
     const Options &options() const { return mOptions; }
     bool suspended() const { return mSuspended; }
     bool saveFileIds();
     void onJobOutput(JobOutput&& out);
-    void addJob(const std::shared_ptr<IndexerJob> &job);
     std::shared_ptr<Project> project(const Path &path) const { return mProjects.value(path); }
-    // void index(const Source &source, const Path &project, uint32_t flags);
-    // void index(const std::shared_ptr<Unit> &unit, const std::shared_ptr<Project> &project);
     bool shouldIndex(const Source &source, const Path &project) const;
     void stopServers();
     int mongooseStatistics(struct mg_connection *conn);
     void dumpJobs(Connection *conn);
+    std::shared_ptr<JobScheduler> jobScheduler() const { return mJobScheduler; }
 private:
     void restoreFileIds();
-    bool index(const String &arguments, const Path &pwd, const Path &projectRootOverride, bool escape);
+    bool index(const String &arguments, const Path &pwd,
+               const Path &projectRootOverride, unsigned int sourceFlags = 0);
     void onNewConnection(SocketServer *server);
     void setCurrentProject(const std::shared_ptr<Project> &project, unsigned int queryFlags = 0);
     void onUnload();
-    void onNewMessage(Message *message, Connection *conn);
+    void onNewMessage(const std::shared_ptr<Message> &message, Connection *conn);
     void clearProjects();
-    void handleCompileMessage(CompileMessage &message, Connection *conn);
-    void handleIndexerMessage(const IndexerMessage &message, Connection *conn);
-    void handleQueryMessage(const QueryMessage &message, Connection *conn);
-    void handleErrorMessage(const ErrorMessage &message, Connection *conn);
-    void handleLogOutputMessage(const LogOutputMessage &message, Connection *conn);
-    void handleVisitFileMessage(const VisitFileMessage &message, Connection *conn);
+    void handleIndexMessage(const std::shared_ptr<IndexMessage> &message, Connection *conn);
+    void handleIndexerMessage(const std::shared_ptr<IndexerMessage> &message, Connection *conn);
+    void handleQueryMessage(const std::shared_ptr<QueryMessage> &message, Connection *conn);
+    void handleErrorMessage(const std::shared_ptr<ErrorMessage> &message, Connection *conn);
+    void handleLogOutputMessage(const std::shared_ptr<LogOutputMessage> &message, Connection *conn);
+    void handleVisitFileMessage(const std::shared_ptr<VisitFileMessage> &message, Connection *conn);
 
     // Queries
-    void sendDiagnostics(const QueryMessage &query, Connection *conn);
-    void clearProjects(const QueryMessage &query, Connection *conn);
-    void codeCompleteAt(const QueryMessage &query, Connection *conn);
-    void cursorInfo(const QueryMessage &query, Connection *conn);
-    void dependencies(const QueryMessage &query, Connection *conn);
-    void dumpFile(const QueryMessage &query, Connection *conn);
-    void findFile(const QueryMessage &query, Connection *conn);
-    void findSymbols(const QueryMessage &query, Connection *conn);
-    void fixIts(const QueryMessage &query, Connection *conn);
-    void followLocation(const QueryMessage &query, Connection *conn);
-    void hasFileManager(const QueryMessage &query, Connection *conn);
-    void isIndexed(const QueryMessage &query, Connection *conn);
-    void isIndexing(const QueryMessage &, Connection *conn);
-    void jobCount(const QueryMessage &query, Connection *conn);
-    void listSymbols(const QueryMessage &query, Connection *conn);
-    void preprocessFile(const QueryMessage &query, Connection *conn);
-    void project(const QueryMessage &query, Connection *conn);
-    void referencesForLocation(const QueryMessage &query, Connection *conn);
-    void referencesForName(const QueryMessage &query, Connection *conn);
-    void reindex(const QueryMessage &query, Connection *conn);
-    void reloadFileManager(const QueryMessage &query, Connection *conn);
-    void reloadProjects(const QueryMessage &query, Connection *conn);
-    void removeFile(const QueryMessage &query, Connection *conn);
-    void removeProject(const QueryMessage &query, Connection *conn);
-    void shutdown(const QueryMessage &query, Connection *conn);
-    void sources(const QueryMessage &query, Connection *conn);
-    void dumpCompletions(const QueryMessage &query, Connection *conn);
-    void status(const QueryMessage &query, Connection *conn);
-    void syncProject(const QueryMessage &qyery, Connection *conn);
-    void suspend(const QueryMessage &query, Connection *conn);
+    void sendDiagnostics(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void clearProjects(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void codeCompleteAt(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void cursorInfo(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void dependencies(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void dumpFile(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void generateTest(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void findFile(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void findSymbols(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void fixIts(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void followLocation(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void hasFileManager(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void isIndexed(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void isIndexing(const std::shared_ptr<QueryMessage> &, Connection *conn);
+    void jobCount(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void listSymbols(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void preprocessFile(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void project(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void referencesForLocation(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void referencesForName(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void reindex(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void reloadFileManager(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void reloadProjects(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void removeFile(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void removeProject(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void shutdown(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void sources(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void dumpCompletions(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void dumpCompilationDatabase(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void status(const std::shared_ptr<QueryMessage> &query, Connection *conn);
+    void syncProject(const std::shared_ptr<QueryMessage> &qyery, Connection *conn);
+    void suspend(const std::shared_ptr<QueryMessage> &query, Connection *conn);
 
-    std::shared_ptr<Project> projectForQuery(const QueryMessage &queryMessage);
+    std::shared_ptr<Project> projectForQuery(const std::shared_ptr<QueryMessage> &queryMessage);
     std::shared_ptr<Project> currentProject() const { return mCurrentProject.lock(); }
     int reloadProjects();
     std::shared_ptr<Project> addProject(const Path &path);
-    void onProcessFinished(Process *process)
-    {
-        assert(process->pid() > 0);
-        auto it = mActiveJobs.find(process->pid());
-        std::shared_ptr<IndexerJob> job;
-        if (it != mActiveJobs.end() && it->second->process == process) {
-            job = it->second;
-            mActiveJobs.erase(it);
-        }
-
-        onJobFinished(process, job);
-    }
-
-    void onJobFinished(Process *process, const std::shared_ptr<IndexerJob> &job);
 
     bool hasServer() const;
     void onHttpClientReadyRead(const SocketClient::SharedPtr &socket);
@@ -185,10 +180,11 @@ private:
 
     Timer mUnloadTimer;
 
-    LinkedList<std::shared_ptr<IndexerJob> > mPendingJobs;
-    Hash<pid_t, std::shared_ptr<IndexerJob> > mActiveJobs;
+    std::shared_ptr<JobScheduler> mJobScheduler;
 
     CompletionThread *mCompletionThread;
+
+    Signal<std::function<void()> > mIndexerMessageReceived;
 };
 
 #endif

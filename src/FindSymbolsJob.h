@@ -19,12 +19,12 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include <rct/String.h>
 #include <rct/List.h>
 #include "QueryMessage.h"
-#include "Job.h"
+#include "QueryJob.h"
 
-class FindSymbolsJob : public Job
+class FindSymbolsJob : public QueryJob
 {
 public:
-    FindSymbolsJob(const QueryMessage &query, const std::shared_ptr<Project> &project);
+    FindSymbolsJob(const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &project);
 protected:
     virtual int execute();
 private:

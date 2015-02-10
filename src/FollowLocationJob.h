@@ -19,13 +19,13 @@ along with RTags.  If not, see <http://www.gnu.org/licenses/>. */
 #include <rct/String.h>
 #include <rct/List.h>
 #include "RTags.h"
-#include "Job.h"
+#include "QueryJob.h"
 #include "Location.h"
 
-class FollowLocationJob : public Job
+class FollowLocationJob : public QueryJob
 {
 public:
-    FollowLocationJob(const Location &loc, const QueryMessage &query, const std::shared_ptr<Project> &project);
+    FollowLocationJob(const Location &loc, const std::shared_ptr<QueryMessage> &query, const std::shared_ptr<Project> &project);
 protected:
     virtual int execute();
 private:

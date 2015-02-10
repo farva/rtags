@@ -58,7 +58,7 @@ public:
     {}
 
     Location(uint32_t fileId, uint32_t line, uint32_t col)
-        : mData((static_cast<uint64_t>(fileId) << (64 - FileBits)) | (static_cast<uint64_t>(line) << (64 - FileBits - LineBits)) | col)
+        : mData((static_cast<uint64_t>(col) << (FileBits + LineBits)) | (static_cast<uint64_t>(line) << (FileBits)) | fileId)
     {
     }
 
@@ -92,9 +92,9 @@ public:
         return id;
     }
 
-    inline uint32_t fileId() const { return ((mData & FILEID_MASK) >> (64 - FileBits)); }
-    inline uint32_t line() const { return ((mData & LINE_MASK) >> (64 - FileBits - LineBits)); }
-    inline uint32_t column() const { return static_cast<uint32_t>(mData & COLUMN_MASK); }
+    inline uint32_t fileId() const { return static_cast<uint32_t>(mData & FILEID_MASK); }
+    inline uint32_t line() const { return static_cast<uint32_t>((mData & LINE_MASK) >> FileBits); }
+    inline uint32_t column() const { return static_cast<uint32_t>((mData & COLUMN_MASK) >> (FileBits + LineBits)); }
 
     inline Path path() const
     {
@@ -139,14 +139,15 @@ public:
         return compare(other) > 0;
     }
 
-    String context() const;
-
     enum KeyFlag {
         NoFlag = 0x0,
-        ShowContext = 0x1
+        ShowContext = 0x1,
+        NoColor = 0x2
     };
 
     String key(unsigned flags = NoFlag) const;
+    String context(unsigned flags) const;
+
     static Location decode(const String &data)
     {
         uint32_t col;
@@ -162,14 +163,14 @@ public:
         error("Failed to make location from [%s:%d:%d]", path.constData(), line, col);
         return Location();
     }
-    static String encode(const String &key)
+    static String encode(const String &key, const Path &pwd = Path())
     {
         char path[PATH_MAX];
         uint32_t line, col;
         if (sscanf(key.constData(), "%[^':']:%d:%d", path, &line, &col) != 3)
             return String();
 
-        Path resolved = Path::resolved(path, Path::MakeAbsolute);
+        Path resolved = Path::resolved(path, Path::MakeAbsolute, pwd);
         {
             char buf[8];
             memcpy(buf, &line, sizeof(line));
@@ -180,14 +181,14 @@ public:
         return resolved;
     }
 
-    static Location fromPathLineAndColumn(const String &str)
+    static Location fromPathLineAndColumn(const String &str, const Path &pwd = Path())
     {
         char path[PATH_MAX];
         uint32_t line, col;
         if (sscanf(str.constData(), "%[^':']:%d:%d", path, &line, &col) != 3)
             return Location();
 
-        const Path resolved = Path::resolved(path);
+        const Path resolved = Path::resolved(path, Path::RealPath, pwd);
         return Location(Location::insertFile(resolved), line, col);
     }
     static Hash<uint32_t, Path> idsToPaths()
@@ -244,10 +245,10 @@ private:
     static const uint64_t COLUMN_MASK;
 };
 
-template <> inline int fixedSize(const Location &)
+template <> struct FixedSize<Location>
 {
-    return sizeof(uint64_t);
-}
+    static constexpr size_t value = sizeof(Location::mData);
+};
 
 template <> inline Serializer &operator<<(Serializer &s, const Location &t)
 {

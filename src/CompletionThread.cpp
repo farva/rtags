@@ -105,7 +105,8 @@ void CompletionThread::completeAt(const Source &source, const Location &location
 
 String CompletionThread::dump()
 {
-    Dump dump = { false };
+    Dump dump;
+    dump.done = false;
     {
         std::unique_lock<std::mutex> lock(mMutex);
         if (mDump)
@@ -299,9 +300,7 @@ void CompletionThread::process(Request *request)
     }
 
     sw.restart();
-    const unsigned int completionFlags = (CXCodeComplete_IncludeMacros
-                                          |CXCodeComplete_IncludeCodePatterns
-                                          |CXCodeComplete_IncludeBriefComments);
+    const unsigned int completionFlags = (CXCodeComplete_IncludeMacros|CXCodeComplete_IncludeCodePatterns);
 
     CXCodeCompleteResults *results = clang_codeCompleteAt(cache->translationUnit, sourceFile.constData(),
                                                           request->location.line(), request->location.column(),
@@ -328,8 +327,6 @@ void CompletionThread::process(Request *request)
                 continue;
 
             const int priority = clang_getCompletionPriority(string);
-            if (priority >= 70)
-                continue;
 
             Completions::Candidate &node = nodes[nodeCount];
             node.cursorKind = kind;
